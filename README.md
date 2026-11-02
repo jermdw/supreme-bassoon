@@ -1,25 +1,16 @@
 # supreme-bassoon
 
-Spotify **Now Playing** bridge + native **AWTRIX NG Berry** display app purpose-built for the **Ulanzi TC002 (`52×16`)** Smart Pixel Clock (also backward-compatible with `32×8` TC001 panels).
+Spotify **Now Playing** bridge + native **AWTRIX NG Berry** display plugin purpose-built for the **Ulanzi TC002 (`52×16`)** Smart Pixel Clock (and backward-compatible with `32×8` TC001 matrices).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 ![Node](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=node.js)
 ![AWTRIX NG](https://img.shields.io/badge/firmware-AWTRIX_NG-00AAFF?style=flat-square)
 
----
-
-## Features
-
-- **Live `16×16` Pixelated Album Art:** Downloads Spotify's compact cover art, applies Lanczos3 downsampling, clamps near-black LED noise to `0x000000`, and boosts color saturation so covers pop cleanly on RGB matrices.
-- **Dynamic Album Accent Colors:** Extracts a high-contrast dominant hue from each album cover to tint the Artist line and bottom progress bar (falling back to Spotify green `#1DB954` on monochrome covers).
-- **`40 FPS` Dual-Line Berry Renderer:** Runs natively on the clock (`berry/spotify_now_playing.be`) so the Song Title (top row) and Artist (second row) scroll smoothly and independently without flooding Wi-Fi.
-- **Smart App Rotation:** Automatically enables the app in your clock's rotation when Spotify plays on *any* device (phone, desktop, smart speaker), switches immediately to the track when songs change, and removes itself from rotation after a brief grace period when paused.
-- **Physical Button / Knob Controls:** Press the middle/knob button (`select`) on the TC002 to **Play / Pause** Spotify; optionally enable Left/Right **Prev / Next** track skipping via the AWTRIX NG Web UI.
-- **Built-In Setup Dashboard & `52×16` Matrix Simulator:** Visit `http://127.0.0.1:8765` to connect Spotify in one click (with headless manual callback support) and preview the live `52×16` pixel matrix in your browser.
+Unlike legacy AWTRIX 3 automations built for single-line `32×8` displays, this plugin takes full advantage of the TC002's `52×16` vertical height and physical controls—rendering **live `16×16` album cover art**, **dual-line `40 FPS` independent scrolling text** (Title + album-tinted Artist), an **interpolated progress bar**, and **physical button playback controls**.
 
 ---
 
-## Architecture
+## Architecture Overview
 
 ```mermaid
 flowchart LR
@@ -48,7 +39,15 @@ flowchart LR
     Buttons -->|"GET /api/action/play|pause|next"| Bridge
 ```
 
-### `52×16` Pixel Layout (Ulanzi TC002)
+### Why a Hybrid Docker + Berry Design?
+
+1. **Docker handles what microcontrollers shouldn't:** Spotify OAuth 2.0 refresh-token rotation, downloading JPEG cover art, `16×16` Lanczos3 downsampling, LED gamma black-floor clamping (so dark album shadows turn off cleanly instead of glowing muddy grey), and vibrant accent color extraction.
+2. **Berry handles `40 FPS` rendering locally on the clock:** Instead of spamming 20+ HTTP draw payloads per second over Wi-Fi, [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be) runs directly on the TC002's ESP32-S3, scrolling both text lines independently and interpolating the progress bar between 2-second polls.
+3. **Delta Artwork Caching over Wi-Fi:** The clock passes `?track=<current_id>` on each poll. When the song hasn't changed, the bridge omits the 256-pixel RGB array—shrinking poll responses to ~180 bytes.
+
+---
+
+## `52×16` Pixel Canvas Layout
 
 ```text
 Columns: 0               15  16  17                                51
@@ -67,52 +66,86 @@ Row 15 │                   │ p │  █████████████�
 
 ---
 
-## Quick Start
+## Step-by-Step Setup Guide
 
-### 1. Create a Spotify Developer App
+### 1. Create Your Spotify Developer App
 
-> **Important Spotify Developer Mode Rules:**
+> **Spotify Developer Mode Requirements:**
 > 1. Your Spotify Developer account **must have an active Spotify Premium subscription**.
-> 2. Spotify **bans `localhost`** in HTTP Redirect URIs — you **must** use `http://127.0.0.1:8765/callback`.
+> 2. Spotify **bans `localhost`** in HTTP Redirect URIs—you **must** use the explicit IPv4 loopback literal `http://127.0.0.1:8765/callback`.
 
-1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and click **Create app**.
-2. Configure:
+1. Open the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and click **Create app**.
+2. Fill in the form:
+   - **App name:** `TC002 Now Playing`
+   - **App description:** `AWTRIX NG Now Playing display`
    - **Redirect URIs:** `http://127.0.0.1:8765/callback` *(click **Add**)*
-   - Check **Web API** and click **Save**.
-3. Copy your **Client ID** and **Client Secret** from the app's **Settings** page.
+   - **Which API/SDKs are you planning to use?** Check **only `Web API`** *(leave Web Playback SDK, Android, iOS, and Ads API unchecked)*.
+   - Accept the Developer Terms and click **Save**.
+3. Open your app's **Settings** page and copy your **Client ID** and **Client Secret**.
+4. *(If prompted under **User Management**)* Ensure your Spotify account email is allowlisted on the app.
 
-### 2. Configure `.env`
+---
+
+### 2. Configure `.env` & Launch Docker Compose
+
+Clone the repository onto your always-on desktop and create your `.env` file:
 
 ```bash
+git clone https://github.com/jermdw/supreme-bassoon.git
+cd supreme-bassoon
 cp .env.example .env
 ```
 
-Edit `.env` with your Spotify credentials, your TC002's LAN IP (`AWTRIX_HOST`), and your desktop's LAN IP (`SERVER_LAN_URL`):
+Edit `.env` with your Spotify credentials, your TC002's static LAN IP (`AWTRIX_HOST`), and your desktop's LAN IP (`SERVER_LAN_URL`):
 
 ```ini
 SPOTIFY_CLIENT_ID=your_spotify_client_id_here
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8765/callback
 
+# Static IP of your Ulanzi TC002 on your home LAN (preferred over .local inside Docker)
 AWTRIX_HOST=192.168.1.50
 AWTRIX_APP_NAME=spotify
 AUTO_INSTALL_SCRIPT=true
 
+# LAN IP of your always-on desktop so the TC002 can reach this container over Wi-Fi
 PORT=8765
 SERVER_LAN_URL=http://192.168.1.100:8765
 ```
 
-### 3. Launch with Docker Compose
+Build and start the container in the background:
 
 ```bash
 docker compose up -d --build
 ```
 
-On boot, the container automatically installs `berry/spotify_now_playing.be` onto your AWTRIX NG clock and configures its `server_url` setting.
+Verify the container started cleanly and deployed the Berry script to your clock:
 
-### 4. Authorize Spotify
+```bash
+docker compose logs -f
+```
 
-Open **[http://127.0.0.1:8765](http://127.0.0.1:8765)** in your browser and click **Connect Spotify** (or expand *"Running on a headless machine?"* to paste the callback URL manually if signing in from another machine).
+---
+
+### 3. Authorize Spotify & Test the Live Simulator
+
+1. On your always-on desktop, open **[http://127.0.0.1:8765](http://127.0.0.1:8765)**.
+2. Click **Connect Spotify** and approve access.
+   - **Headless / Remote Desktop Tip:** If you opened `http://<DESKTOP_LAN_IP>:8765` from another laptop, Spotify will redirect your browser to `http://127.0.0.1:8765/callback?code=...` after approving. Copy that full URL from your browser's address bar, expand **"Running on a headless machine?"** on the setup dashboard, and paste it in.
+3. Start playing any song or podcast on your **phone**, **computer**, or **smart speaker**.
+   - Within ~2 seconds, both the **`52×16` Matrix Simulator** in your browser and your physical **Ulanzi TC002** will display the album cover, song title, artist, and progress bar.
+
+---
+
+## Clock Behavior & Physical Controls
+
+| Trigger / Input | Behavior |
+| :--- | :--- |
+| **Playback Starts** | Enables `spotify` in the AWTRIX NG app rotation and switches straight to it |
+| **Track Changes** | Switches the display back to `spotify` immediately so you see the new song & cover |
+| **Playback Paused** | Waits `PAUSE_GRACE_MS` (`6s` default), then disables `spotify` from rotation so only active apps cycle |
+| **Middle / Knob Press (`select`)** | Toggles Spotify **Play / Pause** with an on-screen `PLAY` / `PAUSE` badge |
+| **Left / Right Buttons** *(Optional)* | Enable **Left/Right Skip Tracks** in the AWTRIX NG Web UI (*Apps → spotify → Gear Icon*) to trigger **Prev / Next** track |
 
 ---
 
@@ -139,7 +172,30 @@ Open **[http://127.0.0.1:8765](http://127.0.0.1:8765)** in your browser and clic
 
 ---
 
-## Development & Tests
+## Bridge HTTP Endpoints
+
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/` | `GET` | OAuth setup dashboard + live `52×16` `<canvas>` matrix simulator |
+| `/api/now-playing?track=<id>` | `GET` | Compact JSON polled by the TC002 Berry script (omits `art` when `track` matches) |
+| `/api/preview` | `GET` | Full playback + `16×16` artwork snapshot for the browser preview |
+| `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints used by the TC002 buttons and web UI |
+| `/berry/spotify_now_playing.be` | `GET` | Serves raw Berry script source for inspection or manual installation |
+| `/healthz` | `GET` | Docker container healthcheck endpoint |
+
+---
+
+## Tuning & Troubleshooting
+
+- **Album colors look too bright or dark shadows look grey:** Adjust `LED_GAMMA` (default `1.55`; higher values darken midtones/shadows) and `LED_SATURATION` (default `1.25`) in `.env`, then run `docker compose up -d`.
+- **Clock stays on `"Spotify / Waiting..."`:**
+  1. Ensure `SERVER_LAN_URL` in `.env` uses your desktop's actual LAN IP (e.g. `http://192.168.1.100:8765`, **not** `127.0.0.1`).
+  2. Check that your desktop's firewall allows inbound TCP port `8765` from your local network.
+- **Manual Berry Script Installation:** If you set `AUTO_INSTALL_SCRIPT=false`, open your clock's Web UI → **Scripts**, create a script named `spotify`, paste the contents of [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be), and set its **Bridge Server URL** config field to `http://<YOUR_DESKTOP_LAN_IP>:8765`.
+
+---
+
+## Local Development & Tests
 
 ```bash
 npm install
