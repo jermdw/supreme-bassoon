@@ -1,0 +1,11 @@
+services:
+  awtrix-spotify:
+    build: .
+    container_name: awtrix-spotify
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8765}:${PORT:-8765}"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

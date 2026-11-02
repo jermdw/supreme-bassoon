@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Environment & OAuth Secrets
+.env
+.env.*
+!.env.example
+data/
+
+# OS & Editor
+.DS_Store
+*.log
