@@ -62,6 +62,28 @@ export class AwtrixCoordinator {
     return this.client;
   }
 
+  async _setAppEnabled(client, enabled) {
+    if (typeof client.apps?.setEnabled === 'function') {
+      await client.apps.setEnabled(this.appName, enabled);
+      return;
+    }
+    if (!enabled && typeof client.apps?.disable === 'function') {
+      await client.apps.disable(this.appName);
+      return;
+    }
+    if (typeof client.apps?.list === 'function' && typeof client.apps?.setOrder === 'function') {
+      const list = await client.apps.list();
+      if (Array.isArray(list)) {
+        const order = list.map((item) => {
+          const name = typeof item === 'string' ? item : item.name;
+          const curEnabled = typeof item === 'object' && item !== null ? Boolean(item.enabled ?? true) : true;
+          return { name, enabled: name === this.appName ? enabled : curEnabled };
+        });
+        await client.apps.setOrder(order);
+      }
+    }
+  }
+
   async ensureScriptInstalled() {
     if (!this.isConfigured() || !this.autoInstallScript || this.scriptSynced) {
       return;
@@ -137,7 +159,7 @@ export class AwtrixCoordinator {
       try {
         const client = await this._getClient();
         if (wasHidden) {
-          await client.apps.setEnabled(this.appName, true);
+          await this._setAppEnabled(client, true);
           this.appEnabled = true;
           console.log(`[awtrix] Enabled "${this.appName}" in rotation`);
         }
@@ -172,7 +194,7 @@ export class AwtrixCoordinator {
   async _disableApp() {
     try {
       const client = await this._getClient();
-      await client.apps.setEnabled(this.appName, false);
+      await this._setAppEnabled(client, false);
       this.appEnabled = false;
       this.lastActiveTrackId = '';
       this.lastError = null;
