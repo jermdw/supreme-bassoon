@@ -211,6 +211,54 @@ test('AwtrixCoordinator enables app, switches on track change, and hides on paus
   coord.dispose();
 });
 
+test('AwtrixCoordinator falls back to the order route on firmware without the enable route', async () => {
+  const orders = [];
+  let enableCalls = 0;
+  const apps = [
+    { name: 'spotify', enabled: true, slot: 1 },
+    { name: 'Time', enabled: true, slot: 0 },
+    { name: 'Date', enabled: false, slot: null },
+  ];
+  const mockClient = {
+    apps: {
+      setEnabled: async () => {
+        enableCalls++;
+        throw Object.assign(new Error('failed with 400 invalidName'), { status: 400, code: 'invalidName' });
+      },
+      list: async () => apps,
+      setOrder: async (order) => {
+        orders.push(order);
+      },
+    },
+  };
+
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', appName: 'spotify', client: mockClient });
+
+  await coord._setAppEnabled(mockClient, false);
+  await coord._setAppEnabled(mockClient, true);
+
+  assert.equal(enableCalls, 1, 'should stop trying the missing route after the first failure');
+  assert.deepEqual(orders, [
+    { order: ['Time'], disabled: ['Date', 'spotify'] },
+    { order: ['Time', 'spotify'], disabled: ['Date'] },
+  ]);
+});
+
+test('AwtrixCoordinator does not hide other 400 errors behind the order route', async () => {
+  const mockClient = {
+    apps: {
+      setEnabled: async () => {
+        throw Object.assign(new Error('failed with 400 badJson'), { status: 400, code: 'badJson' });
+      },
+      list: async () => assert.fail('should not fall back'),
+    },
+  };
+
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', appName: 'spotify', client: mockClient });
+
+  await assert.rejects(coord._setAppEnabled(mockClient, true), /badJson/);
+});
+
 test('HTTP server omits 256-pixel art payload when ?track= matches cached track on clock', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-srv-test-'));
   const config = loadConfig({ PORT: '0', DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
