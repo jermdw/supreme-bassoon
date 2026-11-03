@@ -5,6 +5,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SCRIPT_PATH = path.resolve(__dirname, '../berry/spotify_now_playing.be');
 
+// Firmware before 1.2.2 has no /apps/{name}/enabled route. It reads "spotify/enabled" as
+// the app name and rejects the slash with 400 invalidName.
+function isEnabledRouteMissing(err) {
+  return err?.status === 404 || (err?.status === 400 && err?.code === 'invalidName');
+}
+
 export class AwtrixCoordinator {
   constructor({
     host,
@@ -34,6 +40,7 @@ export class AwtrixCoordinator {
     this.client = client;
 
     this.scriptSynced = false;
+    this.useOrderRoute = false;
     this.appEnabled = null;
     this.lastActiveTrackId = '';
     this.pauseTimer = null;
@@ -63,25 +70,26 @@ export class AwtrixCoordinator {
   }
 
   async _setAppEnabled(client, enabled) {
-    if (typeof client.apps?.setEnabled === 'function') {
-      await client.apps.setEnabled(this.appName, enabled);
-      return;
-    }
-    if (!enabled && typeof client.apps?.disable === 'function') {
-      await client.apps.disable(this.appName);
-      return;
-    }
-    if (typeof client.apps?.list === 'function' && typeof client.apps?.setOrder === 'function') {
-      const list = await client.apps.list();
-      if (Array.isArray(list)) {
-        const order = list.map((item) => {
-          const name = typeof item === 'string' ? item : item.name;
-          const curEnabled = typeof item === 'object' && item !== null ? Boolean(item.enabled ?? true) : true;
-          return { name, enabled: name === this.appName ? enabled : curEnabled };
-        });
-        await client.apps.setOrder(order);
+    if (!this.useOrderRoute) {
+      try {
+        await client.apps.setEnabled(this.appName, enabled);
+        return;
+      } catch (err) {
+        if (!isEnabledRouteMissing(err)) throw err;
+        this.useOrderRoute = true;
+        console.log('[awtrix] Firmware has no per-app enable route (added in 1.2.2); using the app order route');
       }
     }
+
+    const apps = await client.apps.list();
+    const others = apps.filter((app) => app.name !== this.appName);
+    const order = others
+      .filter((app) => app.enabled)
+      .sort((a, b) => (a.slot ?? Infinity) - (b.slot ?? Infinity))
+      .map((app) => app.name);
+    const disabled = others.filter((app) => !app.enabled).map((app) => app.name);
+    (enabled ? order : disabled).push(this.appName);
+    await client.apps.setOrder({ order, disabled });
   }
 
   async ensureScriptInstalled() {
