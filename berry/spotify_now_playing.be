@@ -23,6 +23,7 @@ class SpotifyNowPlaying
   var track_started_ms
   var art
   var art_id
+  var fail_since_ms
 
   var badge_text
   var badge_until
@@ -52,6 +53,7 @@ class SpotifyNowPlaying
     self.track_started_ms = now_ms()
     self.art = nil
     self.art_id = ""
+    self.fail_since_ms = nil
 
     self.badge_text = ""
     self.badge_until = 0
@@ -60,14 +62,18 @@ class SpotifyNowPlaying
     timer.every(self.poll_ms, def () self.poll() end)
   end
 
+  def on_show()
+    self.poll()
+  end
+
   def poll()
     if self.in_flight || self.server_url == nil || size(self.server_url) == 0
       return
     end
     self.in_flight = true
 
-    var url = self.server_url + "/api/now-playing?art=" + self.art_id
-    http.get(url, def (a, b) self.on_poll_response(a, b) end)
+    var url = self.server_url + "/api/now-playing?clock=1&art=" + self.art_id
+    http.get(url, def (a, b) self.on_poll_response(a, b) end, {"timeout": 5})
   end
 
   def on_poll_response(a, b)
@@ -83,9 +89,15 @@ class SpotifyNowPlaying
       status = b
     end
 
+    # Count failed requests rather than time since the last success: the firmware pauses
+    # this script while the app is disabled, and that pause must not read as an outage.
     if status != 200 || body == nil || size(body) == 0
+      if self.fail_since_ms == nil
+        self.fail_since_ms = now_ms()
+      end
       return
     end
+    self.fail_since_ms = nil
 
     try
       var d = json.load(body)
@@ -206,6 +218,7 @@ class SpotifyNowPlaying
 
     var w = width()
     var h = height()
+    var offline = self.fail_since_ms != nil && now_ms() - self.fail_since_ms > 15000
     var text_x = 17
     var avail_w = w - text_x
     if avail_w < 8
@@ -226,7 +239,13 @@ class SpotifyNowPlaying
     else
       if h >= 16
         self.draw_scrolling_line(text_x, 6, avail_w, self.title, 0xFFFFFF, 0)
-        self.draw_scrolling_line(text_x, 14, avail_w, self.artist, self.accent, 600)
+        if offline
+          text(text_x, 14, "OFFLINE", 0xFFA500)
+        else
+          self.draw_scrolling_line(text_x, 14, avail_w, self.artist, self.accent, 600)
+        end
+      elif offline
+        text(text_x, 6, "OFFLINE", 0xFFA500)
       else
         self.draw_scrolling_line(text_x, 6, avail_w, self.title + " - " + self.artist, 0xFFFFFF, 0)
       end
@@ -254,7 +273,7 @@ class SpotifyNowPlaying
     # 3. Interpolated 1px bottom progress bar across text column
     if h >= 16
       var elapsed = self.progress_ms
-      if self.playing
+      if self.playing && !offline
         elapsed += now_ms() - self.sync_at_ms
       end
       if elapsed < 0

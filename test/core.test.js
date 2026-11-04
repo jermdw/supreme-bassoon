@@ -259,6 +259,119 @@ test('AwtrixCoordinator does not hide other 400 errors behind the order route', 
   await assert.rejects(coord._setAppEnabled(mockClient, true), /badJson/);
 });
 
+test('SpotifyClient reports API errors instead of treating them as nothing playing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-spotify-err-'));
+  try {
+    const store = new TokenStore(tmpDir);
+    await store.save({ accessToken: 'token', refreshToken: 'refresh', expiresAtMs: Date.now() + 3_600_000 });
+    let status = 500;
+    const client = new SpotifyClient({
+      clientId: 'cid',
+      clientSecret: 'sec',
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      tokenStore: store,
+      fetchFn: async () => ({ ok: status < 400, status, headers: new Headers(), text: async () => '' }),
+    });
+
+    for (status of [403, 500, 502, 503]) {
+      await assert.rejects(client.getCurrentlyPlaying(), new RegExp(`HTTP ${status}`));
+    }
+
+    status = 204;
+    const idle = await client.getCurrentlyPlaying();
+    assert.equal(idle.playing, false);
+    assert.equal(idle.id, '');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('AwtrixCoordinator applies playback state in the background and keeps only the newest', async () => {
+  const switched = [];
+  let releaseClock;
+  const clockBlocked = new Promise((resolve) => {
+    releaseClock = resolve;
+  });
+  const mockClient = {
+    apps: {
+      setEnabled: async () => {
+        await clockBlocked;
+      },
+      switchTo: async () => {},
+    },
+  };
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', autoInstallScript: false, client: mockClient });
+  const realApply = coord.onPlaybackState.bind(coord);
+  coord.onPlaybackState = async (state) => {
+    switched.push(state.id);
+    await realApply(state);
+  };
+
+  const done = coord.requestPlaybackSync({ playing: true, id: 't1' });
+  coord.requestPlaybackSync({ playing: true, id: 't2' });
+  coord.requestPlaybackSync({ playing: true, id: 't3' });
+  assert.deepEqual(switched, ['t1'], 'later states must wait for the clock without blocking the caller');
+
+  releaseClock();
+  await done;
+  assert.deepEqual(switched, ['t1', 't3']);
+  coord.dispose();
+});
+
+test('AwtrixCoordinator runs only one script install at a time', async () => {
+  let installs = 0;
+  const mockClient = {
+    scripts: {
+      getSource: async () => null,
+      install: async () => {
+        installs++;
+        return {};
+      },
+      getConfig: async () => ({}),
+      updateConfig: async () => {},
+    },
+  };
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', serverLanUrl: 'http://x:1', client: mockClient });
+
+  await Promise.all([coord.ensureScriptInstalled(), coord.ensureScriptInstalled()]);
+  assert.equal(installs, 1);
+  assert.equal(coord.scriptSynced, true);
+});
+
+test('Dashboard preview reports when the clock itself last polled', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-poll-test-'));
+  const config = loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
+  const awtrix = { appEnabled: true };
+  const server = createBridgeServer({
+    config,
+    spotify: {},
+    awtrix,
+    getCurrentSnapshot: () => ({ playing: false, id: '', progressMs: 0, durationMs: 1, updatedAtMs: Date.now() }),
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const preview = async () => (await fetch(`${base}/api/preview`)).json();
+
+  try {
+    assert.equal((await preview()).clockLastPollAgoMs, null);
+
+    await fetch(`${base}/api/now-playing?art=`);
+    assert.equal((await preview()).clockLastPollAgoMs, null, 'other callers must not count as the clock');
+
+    await fetch(`${base}/api/now-playing?clock=1&art=`);
+    const ago = (await preview()).clockLastPollAgoMs;
+    assert.ok(ago >= 0 && ago < 5000, `Unexpected poll age: ${ago}`);
+
+    assert.equal((await preview()).clockAppHidden, false);
+    awtrix.appEnabled = false;
+    assert.equal((await preview()).clockAppHidden, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('HTTP server sends art only when the clock does not already hold that cover', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-srv-test-'));
   const config = loadConfig({ PORT: '0', DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
