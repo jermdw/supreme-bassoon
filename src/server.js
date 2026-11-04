@@ -259,7 +259,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       fb[y * 52 + x] = colorInt;
     }
 
-    function drawText(fb, x0, y0, str, colorInt) {
+    // baseline matches the clock's text(): the row just below the capitals.
+    function drawText(fb, x0, baseline, str, colorInt) {
       const upper = String(str || '').toUpperCase();
       let cx = x0;
       for (const ch of upper) {
@@ -268,7 +269,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
         for (let r = 0; r < 5; r++) {
           const rowBits = glyph[r];
           for (let c = 0; c < w; c++) {
-            if ((rowBits >> (2 - c)) & 1) setLed(fb, cx + c, y0 + r, colorInt);
+            if ((rowBits >> (2 - c)) & 1) setLed(fb, cx + c, baseline - 5 + r, colorInt);
           }
         }
         cx += w + 1;
@@ -302,8 +303,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
 
     function renderFrame() {
       const fb = new Int32Array(52 * 16).fill(0x090c10);
-      drawScrolling(fb, 17, 1, 35, state.title || 'Spotify', 0xffffff, 0);
-      drawScrolling(fb, 17, 8, 35, state.artist || 'Paused', state.accent || 0x1db954, 600);
+      drawScrolling(fb, 17, 6, 35, state.title || 'Spotify', 0xffffff, 0);
+      drawScrolling(fb, 17, 14, 35, state.artist || 'Paused', state.accent || 0x1db954, 600);
 
       for (let y = 0; y < 16; y++) {
         for (let x = 0; x < 17; x++) setLed(fb, x, y, 0x090c10);
@@ -375,9 +376,10 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
       }
 
       if (pathname === '/api/now-playing' && req.method === 'GET') {
-        const clientTrackId = url.searchParams.get('track') || '';
+        const clientArtId = url.searchParams.get('art') || '';
         const snap = getCurrentSnapshot();
-        const includeArt = Boolean(snap.art && snap.id && snap.id !== clientTrackId);
+        const artId = snap.artId || '';
+        const includeArt = Boolean(snap.art && artId && artId !== clientArtId);
         const payload = {
           playing: snap.playing,
           id: snap.id,
@@ -388,6 +390,7 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
             : snap.progressMs,
           durationMs: snap.durationMs,
           accent: snap.accent,
+          artId,
         };
         if (includeArt) {
           payload.art = snap.art;

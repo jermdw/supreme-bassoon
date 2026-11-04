@@ -35,7 +35,7 @@ flowchart LR
     Bridge -->|Lanczos + LED Gamma| CDN
     Bridge <--> Store
     Bridge -->|"Auto-Install, setEnabled,\nswitchTo on Track Change"| Clock
-    Berry -->|"GET /api/now-playing?track=id"| Bridge
+    Berry -->|"GET /api/now-playing?art=id"| Bridge
     Buttons -->|"GET /api/action/play|pause|next"| Bridge
 ```
 
@@ -43,7 +43,7 @@ flowchart LR
 
 1. **Docker handles what microcontrollers shouldn't:** Spotify OAuth 2.0 refresh-token rotation, downloading JPEG cover art, `16×16` Lanczos3 downsampling, LED gamma black-floor clamping (so dark album shadows turn off cleanly instead of glowing muddy grey), and vibrant accent color extraction.
 2. **Berry handles `40 FPS` rendering locally on the clock:** Instead of spamming 20+ HTTP draw payloads per second over Wi-Fi, [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be) runs directly on the TC002's ESP32-S3, scrolling both text lines independently and interpolating the progress bar between 2-second polls.
-3. **Delta Artwork Caching over Wi-Fi:** The clock passes `?track=<current_id>` on each poll. When the song hasn't changed, the bridge omits the 256-pixel RGB array—shrinking poll responses to ~180 bytes.
+3. **Delta Artwork Caching over Wi-Fi:** The clock passes `?art=<cover_id>` on each poll. When it already holds the current cover, the bridge omits the 256-pixel RGB array—shrinking poll responses to ~200 bytes.
 
 ---
 
@@ -177,7 +177,7 @@ docker compose logs -f
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
 | `/` | `GET` | OAuth setup dashboard + live `52×16` `<canvas>` matrix simulator |
-| `/api/now-playing?track=<id>` | `GET` | Compact JSON polled by the TC002 Berry script (omits `art` when `track` matches) |
+| `/api/now-playing?art=<id>` | `GET` | Compact JSON polled by the TC002 Berry script (omits `art` when `art` matches the current cover) |
 | `/api/preview` | `GET` | Full playback + `16×16` artwork snapshot for the browser preview |
 | `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints used by the TC002 buttons and web UI |
 | `/berry/spotify_now_playing.be` | `GET` | Serves raw Berry script source for inspection or manual installation |

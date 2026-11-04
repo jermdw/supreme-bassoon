@@ -1,7 +1,7 @@
 import { loadConfig } from './config.js';
 import { TokenStore } from './store.js';
 import { SpotifyClient } from './spotify.js';
-import { ArtworkProcessor } from './artwork.js';
+import { ArtworkProcessor, buildArtId } from './artwork.js';
 import { AwtrixCoordinator } from './awtrix.js';
 import { createBridgeServer } from './server.js';
 
@@ -47,6 +47,7 @@ async function main() {
     durationMs: 1,
     accent: SPOTIFY_GREEN,
     art: null,
+    artId: '',
     updatedAtMs: Date.now(),
   };
 
@@ -102,6 +103,7 @@ async function main() {
         durationMs: track.durationMs,
         accent,
         art: pixels,
+        artId: pixels && track.imageUrl ? buildArtId(track.imageUrl) : '',
         updatedAtMs: Date.now(),
       };
 

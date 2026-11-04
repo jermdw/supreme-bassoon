@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { processRgb16x16, ArtworkProcessor } from '../src/artwork.js';
+import { processRgb16x16, ArtworkProcessor, buildArtId } from '../src/artwork.js';
 import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId } from '../src/spotify.js';
 import { TokenStore } from '../src/store.js';
 import { AwtrixCoordinator } from '../src/awtrix.js';
@@ -259,7 +259,7 @@ test('AwtrixCoordinator does not hide other 400 errors behind the order route', 
   await assert.rejects(coord._setAppEnabled(mockClient, true), /badJson/);
 });
 
-test('HTTP server omits 256-pixel art payload when ?track= matches cached track on clock', async () => {
+test('HTTP server sends art only when the clock does not already hold that cover', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-srv-test-'));
   const config = loadConfig({ PORT: '0', DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
   const store = new TokenStore(tmpDir);
@@ -272,21 +272,24 @@ test('HTTP server omits 256-pixel art payload when ?track= matches cached track 
   const awtrix = new AwtrixCoordinator({ host: '', serverLanUrl: config.serverLanUrl });
 
   const fakeArt = new Array(256).fill(0x1db954);
+  const coverId = buildArtId('https://i.scdn.co/image/cover');
+  let snapshot = {
+    playing: true,
+    id: 'abc123',
+    title: 'Veridis Quo',
+    artist: 'Daft Punk',
+    progressMs: 10000,
+    durationMs: 300000,
+    accent: 0x1db954,
+    art: fakeArt,
+    artId: coverId,
+    updatedAtMs: Date.now(),
+  };
   const server = createBridgeServer({
     config,
     spotify,
     awtrix,
-    getCurrentSnapshot: () => ({
-      playing: true,
-      id: 'abc123',
-      title: 'Veridis Quo',
-      artist: 'Daft Punk',
-      progressMs: 10000,
-      durationMs: 300000,
-      accent: 0x1db954,
-      art: fakeArt,
-      updatedAtMs: Date.now(),
-    }),
+    getCurrentSnapshot: () => snapshot,
     triggerImmediatePoll: async () => {},
   });
 
@@ -312,19 +315,35 @@ test('HTTP server omits 256-pixel art payload when ?track= matches cached track 
   }
 
   try {
-    // 1st poll from clock (different or empty track id) -> includes 256-pixel art
-    const r1 = await invokeGet('/api/now-playing?track=');
+    // Clock holds no cover -> includes 256-pixel art
+    const r1 = await invokeGet('/api/now-playing?art=');
     const j1 = JSON.parse(r1.body);
     assert.equal(r1.status, 200);
     assert.equal(j1.id, 'abc123');
+    assert.equal(j1.artId, coverId);
     assert.equal(j1.art.length, 256);
 
-    // 2nd poll from clock (?track=abc123) -> omits art to save Wi-Fi & Berry GC
-    const r2 = await invokeGet('/api/now-playing?track=abc123');
+    // Clock holds this cover -> omits art to save Wi-Fi & Berry GC
+    const r2 = await invokeGet(`/api/now-playing?art=${coverId}`);
     const j2 = JSON.parse(r2.body);
     assert.equal(r2.status, 200);
     assert.equal(j2.id, 'abc123');
+    assert.equal(j2.artId, coverId);
     assert.equal(j2.art, undefined);
+
+    // New track whose cover failed to download -> no art, empty id tells the clock to drop the old cover
+    snapshot = { ...snapshot, id: 'next456', art: null, artId: '' };
+    const r3 = JSON.parse((await invokeGet(`/api/now-playing?art=${coverId}`)).body);
+    assert.equal(r3.id, 'next456');
+    assert.equal(r3.artId, '');
+    assert.equal(r3.art, undefined);
+
+    // Download succeeds on a later poll -> the clock still gets the cover for that same track
+    const retriedId = buildArtId('https://i.scdn.co/image/next');
+    snapshot = { ...snapshot, art: fakeArt, artId: retriedId };
+    const r4 = JSON.parse((await invokeGet('/api/now-playing?art=')).body);
+    assert.equal(r4.artId, retriedId);
+    assert.equal(r4.art.length, 256);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -350,4 +369,15 @@ test('Berry script passes structural balance & AWTRIX NG conventions check', asy
   const closers = (stripped.match(/\bend\b/g) || []).length;
   assert.equal(openers, closers, `Unbalanced Berry blocks: ${openers} openers vs ${closers} 'end's`);
   assert.match(src, /return SpotifyNowPlaying\(\)/);
+});
+
+test('Clock and simulator draw the two text lines on the same baselines', async () => {
+  const berry = await fs.readFile(path.resolve(__dirname, '../berry/spotify_now_playing.be'), 'utf8');
+  assert.match(berry, /draw_scrolling_line\(text_x, 6, avail_w, self\.title,/);
+  assert.match(berry, /draw_scrolling_line\(text_x, 14, avail_w, self\.artist,/);
+
+  const server = await fs.readFile(path.resolve(__dirname, '../src/server.js'), 'utf8');
+  assert.match(server, /drawScrolling\(fb, 17, 6, 35, state\.title/);
+  assert.match(server, /drawScrolling\(fb, 17, 14, 35, state\.artist/);
+  assert.match(server, /baseline - 5 \+ r/);
 });
