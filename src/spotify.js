@@ -99,9 +99,14 @@ export class SpotifyClient {
     return `${SPOTIFY_AUTH_URL}?${params.toString()}`;
   }
 
-  async exchangeCode(code, state = null) {
+  /**
+   * requireState is for browser redirects, which anyone can forge. A pasted bare code has no
+   * state to check, so that route relies on the server's same-origin check instead.
+   */
+  async exchangeCode(code, state = null, { requireState = false } = {}) {
     if (!code) throw new Error('Missing authorization code');
-    if (this.pendingOAuthState && state && state !== this.pendingOAuthState) {
+    const stateMissing = requireState && (!state || !this.pendingOAuthState);
+    if (stateMissing || (this.pendingOAuthState && state && state !== this.pendingOAuthState)) {
       throw new Error('OAuth state mismatch; please start sign-in again.');
     }
 

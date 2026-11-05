@@ -1,5 +1,5 @@
 import { loadConfig } from './config.js';
-import { TokenStore } from './store.js';
+import { TokenStore, loadOrCreateClockToken } from './store.js';
 import { SpotifyClient } from './spotify.js';
 import { ArtworkProcessor, buildArtId } from './artwork.js';
 import { AwtrixCoordinator } from './awtrix.js';
@@ -12,6 +12,10 @@ const SPOTIFY_STALE_MS = 60_000;
 async function main() {
   const config = loadConfig();
   const tokenStore = new TokenStore(config.dataDir);
+  const clockToken = await loadOrCreateClockToken(config.dataDir);
+  if (!config.awtrix.autoInstallScript) {
+    console.log(`[awtrix-spotify] AUTO_INSTALL_SCRIPT is off: set the script's Bridge Token field to ${clockToken}`);
+  }
 
   const spotify = new SpotifyClient({
     clientId: config.spotify.clientId,
@@ -37,6 +41,7 @@ async function main() {
     pauseGraceMs: config.polling.pauseGraceMs,
     serverLanUrl: config.serverLanUrl,
     pollActiveMs: config.polling.activeMs,
+    clockToken,
   });
 
   let snapshot = {
@@ -145,6 +150,7 @@ async function main() {
 
   const server = createBridgeServer({
     config,
+    clockToken,
     spotify,
     awtrix,
     getCurrentSnapshot: () => snapshot,

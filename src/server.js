@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -385,7 +386,24 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
 </html>`;
 }
 
-export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot, triggerImmediatePoll, onAuthorized }) {
+/** Browsers always send Origin on POST, so a page on another site can't pass this. */
+function isSameOriginPost(req) {
+  if (req.method !== 'POST' || !req.headers.origin) return false;
+  try {
+    return new URL(req.headers.origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+function tokenMatches(candidate, expected) {
+  if (!candidate || !expected) return false;
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot, triggerImmediatePoll, onAuthorized, clockToken = '' }) {
   let lastClockPollMs = null;
 
   return http.createServer(async (req, res) => {
@@ -436,6 +454,10 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
       }
 
       if (pathname.startsWith('/api/action/')) {
+        // The clock can only send plain GETs, which any web page can trigger, so it needs the token.
+        if (!isSameOriginPost(req) && !tokenMatches(url.searchParams.get('token'), clockToken)) {
+          return sendJson(res, 403, { error: 'Forbidden' });
+        }
         const rawAction = pathname.slice('/api/action/'.length);
         const snap = getCurrentSnapshot();
         const resolvedAction =
@@ -472,12 +494,15 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
         }
         const code = url.searchParams.get('code');
         const state = url.searchParams.get('state');
-        await spotify.exchangeCode(code, state);
+        await spotify.exchangeCode(code, state, { requireState: true });
         if (onAuthorized) onAuthorized();
         return redirect(res, '/?msg=' + encodeURIComponent('Spotify connected! Play a song to see it on your TC002.'));
       }
 
       if (pathname === '/auth/manual-callback' && req.method === 'POST') {
+        if (!isSameOriginPost(req)) {
+          return sendJson(res, 403, { error: 'Forbidden' });
+        }
         const raw = await readBody(req);
         const form = new URLSearchParams(raw);
         const input = (form.get('callbackUrl') || '').trim();
@@ -494,6 +519,9 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
       }
 
       if (pathname === '/auth/logout' && req.method === 'POST') {
+        if (!isSameOriginPost(req)) {
+          return sendJson(res, 403, { error: 'Forbidden' });
+        }
         await spotify.tokenStore.clear();
         return redirect(res, '/?msg=' + encodeURIComponent('Disconnected Spotify tokens.'));
       }

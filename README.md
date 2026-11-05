@@ -36,7 +36,7 @@ flowchart LR
     Bridge <--> Store
     Bridge -->|"Auto-Install, setEnabled,\nswitchTo on Track Change"| Clock
     Berry -->|"GET /api/now-playing?clock=1&art=id"| Bridge
-    Buttons -->|"GET /api/action/play|pause|next"| Bridge
+    Buttons -->|"GET /api/action/play|pause|next?token=…"| Bridge
 ```
 
 ### Why a Hybrid Docker + Berry Design?
@@ -181,7 +181,7 @@ docker compose logs -f
 | `/` | `GET` | OAuth setup dashboard + live `52×16` `<canvas>` matrix simulator |
 | `/api/now-playing?clock=1&art=<id>` | `GET` | Compact JSON polled by the TC002 Berry script (omits `art` when `art` matches the current cover; `clock=1` updates the dashboard's **Clock Last Polled** time) |
 | `/api/preview` | `GET` | Full playback + `16×16` artwork snapshot for the browser preview |
-| `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints used by the TC002 buttons and web UI |
+| `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints. The TC002 buttons send `?token=<clock token>`; the web UI sends a same-origin `POST`. Anything else gets a `403` |
 | `/berry/spotify_now_playing.be` | `GET` | Serves raw Berry script source for inspection or manual installation |
 | `/healthz` | `GET` | Docker container healthcheck endpoint |
 
@@ -193,7 +193,7 @@ docker compose logs -f
 - **Clock stays on `"Spotify / Waiting..."` or shows `OFFLINE`:** Check **Clock Last Polled** on the dashboard. The clock stops polling while the app is hidden, so this only counts during playback. If it isn't updating then, the clock can't reach the bridge:
   1. Ensure `SERVER_LAN_URL` in `.env` uses your desktop's actual LAN IP (e.g. `http://192.168.1.100:8765`, **not** `127.0.0.1`).
   2. Check that your desktop's firewall allows inbound TCP port `8765` from your local network.
-- **Manual Berry Script Installation:** If you set `AUTO_INSTALL_SCRIPT=false`, open your clock's Web UI → **Scripts**, create a script named `spotify`, paste the contents of [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be), and set its **Bridge Server URL** config field to `http://<YOUR_DESKTOP_LAN_IP>:8765`.
+- **Manual Berry Script Installation:** If you set `AUTO_INSTALL_SCRIPT=false`, open your clock's Web UI → **Scripts**, create a script named `spotify`, paste the contents of [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be), and set its **Bridge Server URL** config field to `http://<YOUR_DESKTOP_LAN_IP>:8765`. Also set its **Bridge Token** field to the value the bridge prints in `docker compose logs` at startup, or the clock's buttons will get a `403`.
 
 ---
 

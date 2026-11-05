@@ -1,4 +1,5 @@
 # @config server_url text "Bridge Server URL" default="http://192.168.1.100:8765" help="LAN URL of your awtrix-spotify Docker container"
+# @config token text "Bridge Token" default="" help="Set automatically by the bridge; lets the clock's buttons send playback commands"
 # @config poll_ms number "Poll Interval (ms)" default=2000 min=1000 max=10000
 # @config scroll_speed number "Scroll Speed (ms/px)" default=45 min=20 max=120
 # @config lr_controls bool "Left/Right Skip Tracks" default=false help="Use clock Left/Right buttons for Prev/Next track instead of switching apps"
@@ -7,6 +8,7 @@ import json
 
 class SpotifyNowPlaying
   var server_url
+  var token
   var poll_ms
   var scroll_speed
   var lr_controls
@@ -30,6 +32,7 @@ class SpotifyNowPlaying
 
   def init()
     self.server_url = store.get("server_url", "http://192.168.1.100:8765")
+    self.token = store.get("token", "")
     self.poll_ms = store.get("poll_ms", 2000)
     self.scroll_speed = store.get("scroll_speed", 45)
     self.lr_controls = store.get("lr_controls", false)
@@ -142,7 +145,7 @@ class SpotifyNowPlaying
     end
     self.badge_text = label
     self.badge_until = now_ms() + 1000
-    var url = self.server_url + "/api/action/" + action
+    var url = self.server_url + "/api/action/" + action + "?token=" + self.token
     http.get(url, def (a, b) self.poll() end)
   end
 

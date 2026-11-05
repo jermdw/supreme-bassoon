@@ -23,6 +23,7 @@ export class AwtrixCoordinator {
     pauseGraceMs = 6000,
     serverLanUrl,
     pollActiveMs = 2000,
+    clockToken = '',
     scriptPath = DEFAULT_SCRIPT_PATH,
     client = null,
   }) {
@@ -36,6 +37,7 @@ export class AwtrixCoordinator {
     this.pauseGraceMs = pauseGraceMs;
     this.serverLanUrl = serverLanUrl;
     this.pollActiveMs = pollActiveMs;
+    this.clockToken = clockToken;
     this.scriptPath = scriptPath;
     this.client = client;
 
@@ -130,13 +132,14 @@ export class AwtrixCoordinator {
         console.log(`[awtrix] Installed Berry script "${this.appName}" on ${this.host}`);
       }
 
-      // Sync @config store only if server_url or poll_ms differs
+      // Sync @config store only if server_url, poll_ms or token differs
       let needsConfigUpdate = true;
       try {
         const currentCfg = await client.scripts.getConfig(this.appName);
         const curUrl = currentCfg?.server_url?.value ?? currentCfg?.server_url;
         const curPoll = currentCfg?.poll_ms?.value ?? currentCfg?.poll_ms;
-        if (curUrl === this.serverLanUrl && Number(curPoll) === this.pollActiveMs) {
+        const curToken = currentCfg?.token?.value ?? currentCfg?.token;
+        if (curUrl === this.serverLanUrl && Number(curPoll) === this.pollActiveMs && curToken === this.clockToken) {
           needsConfigUpdate = false;
         }
       } catch {
@@ -147,6 +150,7 @@ export class AwtrixCoordinator {
         await client.scripts.updateConfig(this.appName, {
           server_url: this.serverLanUrl,
           poll_ms: this.pollActiveMs,
+          token: this.clockToken,
         });
         console.log(`[awtrix] Configured "${this.appName}" -> server_url=${this.serverLanUrl}`);
       }

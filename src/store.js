@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -46,4 +47,19 @@ export class TokenStore {
       if (err.code !== 'ENOENT') throw err;
     }
   }
+}
+
+/** Returns the secret the clock sends with its button commands, creating it on first run. */
+export async function loadOrCreateClockToken(dataDir) {
+  const tokenPath = path.join(dataDir, 'clock-token');
+  try {
+    const existing = (await fs.readFile(tokenPath, 'utf8')).trim();
+    if (existing) return existing;
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(tokenPath, token, { mode: 0o600 });
+  return token;
 }

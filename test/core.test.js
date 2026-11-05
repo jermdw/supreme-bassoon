@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import { processRgb16x16, ArtworkProcessor, buildArtId } from '../src/artwork.js';
 import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId } from '../src/spotify.js';
-import { TokenStore } from '../src/store.js';
+import { TokenStore, loadOrCreateClockToken } from '../src/store.js';
 import { AwtrixCoordinator } from '../src/awtrix.js';
 import { createBridgeServer } from '../src/server.js';
 import { loadConfig } from '../src/config.js';
@@ -493,4 +493,165 @@ test('Clock and simulator draw the two text lines on the same baselines', async 
   assert.match(server, /drawScrolling\(fb, 17, 6, 35, state\.title/);
   assert.match(server, /drawScrolling\(fb, 17, 14, 35, state\.artist/);
   assert.match(server, /baseline - 5 \+ r/);
+});
+
+async function withSecurityServer(run) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-sec-test-'));
+  const actions = [];
+  const exchanges = [];
+  let cleared = 0;
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' }),
+    spotify: {
+      controlPlayback: async (action) => actions.push(action),
+      exchangeCode: async (...args) => exchanges.push(args),
+      tokenStore: { clear: async () => cleared++ },
+    },
+    awtrix: {},
+    getCurrentSnapshot: () => ({ playing: true, id: '', progressMs: 0, durationMs: 1, updatedAtMs: Date.now() }),
+    triggerImmediatePoll: async () => {},
+    clockToken: 'secret-token',
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await run({ base, actions, exchanges, getCleared: () => cleared });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+test('Playback commands need the clock token or a same-origin POST', async () => {
+  await withSecurityServer(async ({ base, actions }) => {
+    const status = async (urlPath, init) => (await fetch(base + urlPath, { redirect: 'manual', ...init })).status;
+
+    assert.equal(await status('/api/action/next'), 403);
+    assert.equal(await status('/api/action/next?token=wrong'), 403);
+    assert.equal(await status('/api/action/next?token='), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST' }), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST', headers: { Origin: 'https://evil.example' } }), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST', headers: { Origin: 'null' } }), 403);
+    assert.deepEqual(actions, [], 'rejected requests must not reach Spotify');
+
+    assert.equal(await status('/api/action/next?token=secret-token'), 200);
+    assert.equal(await status('/api/action/toggle', { method: 'POST', headers: { Origin: base } }), 200);
+    assert.deepEqual(actions, ['next', 'pause']);
+  });
+});
+
+test('Playback commands are refused when the server has no clock token', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-sec-test-'));
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir }),
+    spotify: { controlPlayback: async () => assert.fail('must not reach Spotify') },
+    awtrix: {},
+    getCurrentSnapshot: () => ({ playing: false }),
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/action/next?token=`);
+    assert.equal(res.status, 403);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Sign-in forms reject posts from other sites', async () => {
+  await withSecurityServer(async ({ base, exchanges, getCleared }) => {
+    const post = (urlPath, origin) =>
+      fetch(base + urlPath, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(origin ? { Origin: origin } : {}) },
+        body: 'callbackUrl=attacker-code',
+      });
+
+    assert.equal((await post('/auth/logout', 'https://evil.example')).status, 403);
+    assert.equal((await post('/auth/manual-callback', 'https://evil.example')).status, 403);
+    assert.equal(getCleared(), 0);
+    assert.deepEqual(exchanges, []);
+
+    assert.equal((await post('/auth/manual-callback', base)).status, 302);
+    assert.deepEqual(exchanges, [['attacker-code', null]]);
+    assert.equal((await post('/auth/logout', base)).status, 302);
+    assert.equal(getCleared(), 1);
+  });
+});
+
+test('Browser sign-in callback passes state and requires it', async () => {
+  await withSecurityServer(async ({ base, exchanges }) => {
+    await fetch(`${base}/callback?code=c1&state=s1`, { redirect: 'manual' });
+    assert.deepEqual(exchanges, [['c1', 's1', { requireState: true }]]);
+  });
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-state-test-'));
+  try {
+    let tokenRequests = 0;
+    const client = new SpotifyClient({
+      clientId: 'cid',
+      clientSecret: 'sec',
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      tokenStore: new TokenStore(tmpDir),
+      fetchFn: async () => {
+        tokenRequests++;
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ access_token: 'a', refresh_token: 'r', expires_in: 3600 }),
+        };
+      },
+    });
+    const opts = { requireState: true };
+
+    await assert.rejects(client.exchangeCode('code', 'anything', opts), /state mismatch/, 'no sign-in was started');
+    const state = new URL(client.createAuthorizeUrl()).searchParams.get('state');
+    await assert.rejects(client.exchangeCode('code', null, opts), /state mismatch/);
+    await assert.rejects(client.exchangeCode('code', 'wrong', opts), /state mismatch/);
+    assert.equal(tokenRequests, 0);
+
+    await client.exchangeCode('code', state, opts);
+    assert.equal(tokenRequests, 1);
+    await assert.rejects(client.exchangeCode('code', state, opts), /state mismatch/, 'state is single use');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Clock token persists across restarts and reaches the clock', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-token-test-'));
+  try {
+    const dataDir = path.join(tmpDir, 'nested');
+    const token = await loadOrCreateClockToken(dataDir);
+    assert.match(token, /^[0-9a-f]{32}$/);
+    assert.equal(await loadOrCreateClockToken(dataDir), token);
+
+    const updates = [];
+    const coord = new AwtrixCoordinator({
+      host: '192.168.1.50',
+      serverLanUrl: 'http://x:1',
+      clockToken: token,
+      client: {
+        scripts: {
+          getSource: async () => null,
+          install: async () => ({}),
+          getConfig: async () => ({ server_url: 'http://x:1', poll_ms: 2000, token: 'old' }),
+          updateConfig: async (_name, cfg) => updates.push(cfg),
+        },
+      },
+    });
+    await coord.ensureScriptInstalled();
+    assert.equal(updates.length, 1, 'a stale token must trigger a config update');
+    assert.equal(updates[0].token, token);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Berry script sends the token with button commands', async () => {
+  const script = await fs.readFile(new URL('../berry/spotify_now_playing.be', import.meta.url), 'utf8');
+  assert.match(script, /# @config token text/);
+  assert.match(script, /"\/api\/action\/" \+ action \+ "\?token=" \+ self\.token/);
 });
