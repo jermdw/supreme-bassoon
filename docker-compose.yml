@@ -4,7 +4,9 @@ services:
     container_name: awtrix-spotify
     restart: unless-stopped
     ports:
-      - "${PORT:-8765}:${PORT:-8765}"
+      # With BRIDGE_BIND_IP set, publish only on that address and loopback. Unset, publish on all.
+      - "${BRIDGE_BIND_IP:-0.0.0.0}:${PORT:-8765}:${PORT:-8765}"
+      - "${BRIDGE_BIND_IP:+127.0.0.1:}${PORT:-8765}:${PORT:-8765}"
     env_file:
       - .env
     volumes:

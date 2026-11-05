@@ -163,6 +163,7 @@ docker compose logs -f
 | `AWTRIX_USERNAME` / `AWTRIX_PASSWORD` | *(empty)* | Optional AWTRIX NG Web UI Basic Auth credentials |
 | `AWTRIX_APP_NAME` | `spotify` | Script/app name on the clock |
 | `AUTO_INSTALL_SCRIPT` | `true` | Auto-deploy & configure the Berry script on startup |
+| `BRIDGE_BIND_IP` | *(all addresses)* | Publish the bridge only on this address and `127.0.0.1`. It must exist when the container starts, so reserve it on your router |
 | `SERVER_LAN_URL` | `http://<detected-ip>:8765` | LAN URL the TC002 uses to poll this container |
 | `POLL_ACTIVE_MS` | `2000` | Poll interval (ms) while music is playing |
 | `POLL_IDLE_MS` | `5000` | Poll interval (ms) when paused/idle |
