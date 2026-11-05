@@ -37,7 +37,18 @@ export function sanitizeMatrixText(input, { asciiTransliterate = true } = {}) {
       .replace(/Ø/g, 'O')
       .replace(/ø/g, 'o');
   }
-  return text.replace(/\s+/g, ' ').trim();
+  // NFKD above splits Hangul and kana into parts that the mark removal leaves behind.
+  return text.normalize('NFC').replace(/\s+/g, ' ').trim();
+}
+
+/** Retry-After is seconds or an HTTP date. Anything else falls back so backoff still applies. */
+export function parseRetryAfterSeconds(header, nowMs = Date.now()) {
+  const fallback = 5;
+  if (!header) return fallback;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds);
+  const dateMs = Date.parse(header);
+  return Number.isNaN(dateMs) ? fallback : Math.max(0, (dateMs - nowMs) / 1000);
 }
 
 export function pickSmallestCoverImage(images) {
@@ -209,7 +220,7 @@ export class SpotifyClient {
     }
 
     if (res.status === 429) {
-      const retryAfterSec = Number.parseInt(res.headers.get('retry-after') || '5', 10);
+      const retryAfterSec = parseRetryAfterSeconds(res.headers.get('retry-after'));
       this.rateLimitedUntilMs = Date.now() + Math.max(2, retryAfterSec) * 1000;
       console.warn(`[spotify] Rate limited (429); backing off for ${retryAfterSec}s`);
       return { status: 429, data: null };

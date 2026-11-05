@@ -148,6 +148,7 @@ docker compose logs -f
 | **Bridge Unreachable** | After `15s` of failed requests, the clock shows `OFFLINE` on the artist line and freezes the progress bar until the bridge answers again |
 | **Spotify Errors** | The current song stays up through brief errors. After `60s` of failures it counts as stopped, and the dashboard shows the error |
 | **Middle / Knob Press (`select`)** | Toggles Spotify **Play / Pause** with an on-screen `PLAY` / `PAUSE` badge |
+| **Command Fails** | Shows a `FAILED` badge, for example with no active Spotify device. The dashboard shows the reason |
 | **Left / Right Buttons** *(Optional)* | Enable **Left/Right Skip Tracks** in the AWTRIX NG Web UI (*Apps → spotify → Gear Icon*) to trigger **Prev / Next** track |
 
 ---
@@ -169,7 +170,7 @@ docker compose logs -f
 | `POLL_ACTIVE_MS` | `2000` | Poll interval (ms) while music is playing |
 | `POLL_IDLE_MS` | `5000` | Poll interval (ms) when paused/idle |
 | `PAUSED_SCREEN_MS` | `300000` | How long (ms) a paused song stays in the rotation before the app sits out (`0` = straight away) |
-| `KEEP_ON_SCREEN` | `false` | Stay on the `spotify` app while music plays instead of rotating away |
+| `KEEP_ON_SCREEN` | `false` | Stay on the `spotify` app while music plays instead of rotating away. The bridge rechecks the script every `5 min`, so set this here rather than in the clock's Web UI |
 | `POLL_DEEP_IDLE_MS` | `30000` | Spotify poll interval (ms) once nothing has played for `DEEP_IDLE_AFTER_MS` |
 | `DEEP_IDLE_AFTER_MS` | `600000` | How long (ms) without playback before switching to `POLL_DEEP_IDLE_MS` |
 | `SWITCH_ON_TRACK_CHANGE` | `true` | Immediately switch clock view to `spotify` when a new track starts |
@@ -186,7 +187,7 @@ docker compose logs -f
 | `/` | `GET` | OAuth setup dashboard + live `52×16` `<canvas>` matrix simulator |
 | `/api/now-playing?clock=1&art=<id>` | `GET` | Compact JSON polled by the TC002 Berry script (omits `art` when `art` matches the current cover; `clock=1` updates the dashboard's **Clock Last Polled** time) |
 | `/api/preview` | `GET` | Full playback + `16×16` artwork snapshot for the browser preview |
-| `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints. The TC002 buttons send `?token=<clock token>`; the web UI sends a same-origin `POST`. Anything else gets a `403` |
+| `/api/action/play\|pause\|toggle\|next\|previous` | `GET` / `POST` | Playback control endpoints. The TC002 buttons send `?token=<clock token>`; the web UI sends a same-origin `POST`. Anything else gets a `403`. A command Spotify refuses returns Spotify's status and an `error`, such as `404` with no active device |
 | `/berry/spotify_now_playing.be` | `GET` | Serves raw Berry script source for inspection or manual installation |
 | `/healthz` | `GET` | Docker container healthcheck endpoint |
 

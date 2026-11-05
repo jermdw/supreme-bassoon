@@ -6,10 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { processRgb16x16, ArtworkProcessor, buildArtId } from '../src/artwork.js';
-import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId } from '../src/spotify.js';
+import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId, parseRetryAfterSeconds } from '../src/spotify.js';
 import { TokenStore, loadOrCreateClockToken } from '../src/store.js';
 import { AwtrixCoordinator } from '../src/awtrix.js';
-import { createBridgeServer } from '../src/server.js';
+import { createBridgeServer, isUnreachableLanUrl } from '../src/server.js';
 import { loadConfig } from '../src/config.js';
 import { RepeatLimiter } from '../src/logging.js';
 import { isClockVisible, nextPollDelay } from '../src/playback.js';
@@ -512,7 +512,10 @@ async function withSecurityServer(run) {
   const server = createBridgeServer({
     config: loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' }),
     spotify: {
-      controlPlayback: async (action) => actions.push(action),
+      controlPlayback: async (action) => {
+        actions.push(action);
+        return { status: 204, data: null };
+      },
       exchangeCode: async (...args) => exchanges.push(args),
       tokenStore: { clear: async () => cleared++ },
     },
@@ -771,4 +774,215 @@ test('AwtrixCoordinator leaves an app that is already on alone', async () => {
   await coord.onPlaybackState({ playing: false, id: '' });
   assert.deepEqual(calls, []);
   assert.equal(coord.appEnabled, true);
+});
+
+test('sanitizeMatrixText keeps Hangul and kana whole', () => {
+  assert.equal(sanitizeMatrixText('방탄소년단'), '방탄소년단');
+  assert.equal(sanitizeMatrixText('ガラス'), 'ガラス');
+  assert.equal(sanitizeMatrixText('Rosé'), 'Rose');
+});
+
+test('parseRetryAfterSeconds keeps backoff working on any header', () => {
+  assert.equal(parseRetryAfterSeconds('30'), 30);
+  assert.equal(parseRetryAfterSeconds(null), 5);
+  assert.equal(parseRetryAfterSeconds('soon'), 5);
+  assert.equal(parseRetryAfterSeconds('-4'), 0);
+  const now = Date.parse('2026-01-01T00:00:00Z');
+  assert.equal(parseRetryAfterSeconds('Thu, 01 Jan 2026 00:00:20 GMT', now), 20);
+});
+
+test('A malformed Retry-After still stops requests during a rate limit', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-429-test-'));
+  try {
+    const store = new TokenStore(tmpDir);
+    await store.save({ accessToken: 'token', refreshToken: 'refresh', expiresAtMs: Date.now() + 3_600_000 });
+    let requests = 0;
+    const client = new SpotifyClient({
+      clientId: 'cid',
+      clientSecret: 'sec',
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      tokenStore: store,
+      fetchFn: async () => {
+        requests++;
+        return { ok: false, status: 429, headers: new Headers({ 'retry-after': 'soon' }), text: async () => '' };
+      },
+    });
+    assert.equal(await client.getCurrentlyPlaying(), null);
+    assert.equal(await client.getCurrentlyPlaying(), null);
+    assert.equal(requests, 1);
+    assert.ok(Number.isFinite(client.rateLimitedUntilMs));
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Playback commands report what Spotify answered', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-action-test-'));
+  let result = { status: 404, data: { error: { message: 'Player command failed' } } };
+  let polls = 0;
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir }),
+    spotify: { controlPlayback: async () => result },
+    awtrix: {},
+    getCurrentSnapshot: () => ({ playing: false }),
+    triggerImmediatePoll: async () => polls++,
+    clockToken: 'secret',
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const send = () => fetch(`http://127.0.0.1:${server.address().port}/api/action/play?token=secret`);
+  try {
+    let res = await send();
+    assert.equal(res.status, 404);
+    assert.match((await res.json()).error, /No active Spotify device/);
+
+    result = { status: 403, data: { error: { message: 'Premium required' } } };
+    res = await send();
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, 'Premium required');
+
+    result = { status: 429, data: null };
+    res = await send();
+    assert.equal(res.status, 429);
+    assert.match((await res.json()).error, /HTTP 429/);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(polls, 0, 'failed commands change nothing worth polling for');
+
+    result = { status: 204, data: null };
+    res = await send();
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(polls, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('isUnreachableLanUrl flags loopback and Docker addresses only', () => {
+  for (const url of ['http://127.0.0.1:8765', 'http://localhost:8765', 'http://172.22.0.2:8765', 'http://0.0.0.0:8765', 'nonsense']) {
+    assert.equal(isUnreachableLanUrl(url), true, url);
+  }
+  for (const url of ['http://192.168.1.110:8765', 'http://10.0.0.5:8765', 'http://172.32.0.1:8765', 'http://clock-bridge.lan:8765']) {
+    assert.equal(isUnreachableLanUrl(url), false, url);
+  }
+});
+
+test('Dashboard does not claim a pending sync when the script is installed by hand', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-dash-test-'));
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir, AUTO_INSTALL_SCRIPT: 'false', SERVER_LAN_URL: 'http://172.22.0.2:8765' }),
+    spotify: { isAuthorized: async () => false },
+    awtrix: { isConfigured: () => true, scriptSynced: false },
+    getCurrentSnapshot: () => ({ playing: false }),
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const html = await (await fetch(`http://127.0.0.1:${server.address().port}/`)).text();
+    assert.match(html, /Installed manually/);
+    assert.doesNotMatch(html, /Pending sync/);
+    assert.match(html, /alert warn"><strong>Warning:<\/strong> <code>SERVER_LAN_URL/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('AwtrixCoordinator notices a wiped clock without disturbing a healthy one', async () => {
+  const scriptPath = fileURLToPath(new URL('../berry/spotify_now_playing.be', import.meta.url));
+  const source = await fs.readFile(scriptPath, 'utf8');
+  const calls = [];
+  const fields = [
+    { key: 'server_url', value: 'http://x:1' },
+    { key: 'poll_ms', value: 2000 },
+    { key: 'token', value: 'tok' },
+    { key: 'keep_on_screen', value: false },
+  ];
+  const missing = () => Object.assign(new Error('no such script'), { status: 404 });
+  let getSource = async () => source;
+  let getConfig = async () => ({ fields });
+  let appOn = true;
+  const coord = new AwtrixCoordinator({
+    host: '192.168.1.50',
+    serverLanUrl: 'http://x:1',
+    clockToken: 'tok',
+    scriptRecheckMs: 0,
+    client: {
+      apps: {
+        list: async () => [{ name: 'spotify', enabled: appOn }],
+        setEnabled: async () => calls.push('setEnabled'),
+      },
+      scripts: {
+        getSource: () => getSource(),
+        getConfig: () => getConfig(),
+        install: async () => {
+          calls.push('install');
+          return {};
+        },
+        updateConfig: async () => calls.push('updateConfig'),
+      },
+    },
+  });
+
+  await coord.ensureScriptInstalled();
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.deepEqual(calls, [], 'a matching script is left alone');
+
+  appOn = false;
+  await coord.ensureScriptInstalled();
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.deepEqual(calls, [], 'an app the user switched off stays off');
+  appOn = true;
+
+  getSource = async () => {
+    throw Object.assign(new Error('timeout'), { status: undefined });
+  };
+  await coord.ensureScriptInstalled();
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.deepEqual(calls, [], 'a blip must not reinstall');
+  assert.match(coord.lastError, /timeout/);
+
+  getSource = async () => {
+    throw missing();
+  };
+  getConfig = async () => {
+    throw missing();
+  };
+  await coord.ensureScriptInstalled();
+  assert.deepEqual(calls, ['install', 'updateConfig'], 'a wiped clock gets the script back');
+});
+
+test('AwtrixCoordinator rechecks the script only once per interval', async () => {
+  let checks = 0;
+  const coord = new AwtrixCoordinator({
+    host: '192.168.1.50',
+    serverLanUrl: 'http://x:1',
+    client: {
+      apps: { list: async () => [] },
+      scripts: {
+        getSource: async () => {
+          checks++;
+          return null;
+        },
+        install: async () => ({}),
+        getConfig: async () => ({}),
+        updateConfig: async () => {},
+      },
+    },
+  });
+  await coord.ensureScriptInstalled();
+  await coord.ensureScriptInstalled();
+  assert.equal(checks, 1);
+  coord.lastScriptCheckMs = Date.now() - coord.scriptRecheckMs;
+  await coord.ensureScriptInstalled();
+  assert.equal(checks, 2);
+});
+
+test('Berry script reports failed commands and rides out Spotify lag', async () => {
+  const script = await fs.readFile(new URL('../berry/spotify_now_playing.be', import.meta.url), 'utf8');
+  assert.match(script, /self\.on_action_response\(a, b\)/);
+  assert.match(script, /self\.badge_text = "FAILED"/);
+  assert.match(script, /if now_ms\(\) >= self\.state_hold_until\n\s+self\.playing = /);
 });
