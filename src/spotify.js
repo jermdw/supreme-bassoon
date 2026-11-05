@@ -231,6 +231,10 @@ export class SpotifyClient {
       return null; // Caller keeps existing state during rate-limit backoff
     }
 
+    if (status !== 200 && status !== 204) {
+      throw new Error(`Spotify currently-playing request failed with HTTP ${status}`);
+    }
+
     if (status === 204 || !data || !data.item) {
       return {
         playing: false,

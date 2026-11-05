@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { processRgb16x16, ArtworkProcessor } from '../src/artwork.js';
+import { processRgb16x16, ArtworkProcessor, buildArtId } from '../src/artwork.js';
 import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId } from '../src/spotify.js';
 import { TokenStore } from '../src/store.js';
 import { AwtrixCoordinator } from '../src/awtrix.js';
@@ -259,7 +259,120 @@ test('AwtrixCoordinator does not hide other 400 errors behind the order route', 
   await assert.rejects(coord._setAppEnabled(mockClient, true), /badJson/);
 });
 
-test('HTTP server omits 256-pixel art payload when ?track= matches cached track on clock', async () => {
+test('SpotifyClient reports API errors instead of treating them as nothing playing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-spotify-err-'));
+  try {
+    const store = new TokenStore(tmpDir);
+    await store.save({ accessToken: 'token', refreshToken: 'refresh', expiresAtMs: Date.now() + 3_600_000 });
+    let status = 500;
+    const client = new SpotifyClient({
+      clientId: 'cid',
+      clientSecret: 'sec',
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      tokenStore: store,
+      fetchFn: async () => ({ ok: status < 400, status, headers: new Headers(), text: async () => '' }),
+    });
+
+    for (status of [403, 500, 502, 503]) {
+      await assert.rejects(client.getCurrentlyPlaying(), new RegExp(`HTTP ${status}`));
+    }
+
+    status = 204;
+    const idle = await client.getCurrentlyPlaying();
+    assert.equal(idle.playing, false);
+    assert.equal(idle.id, '');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('AwtrixCoordinator applies playback state in the background and keeps only the newest', async () => {
+  const switched = [];
+  let releaseClock;
+  const clockBlocked = new Promise((resolve) => {
+    releaseClock = resolve;
+  });
+  const mockClient = {
+    apps: {
+      setEnabled: async () => {
+        await clockBlocked;
+      },
+      switchTo: async () => {},
+    },
+  };
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', autoInstallScript: false, client: mockClient });
+  const realApply = coord.onPlaybackState.bind(coord);
+  coord.onPlaybackState = async (state) => {
+    switched.push(state.id);
+    await realApply(state);
+  };
+
+  const done = coord.requestPlaybackSync({ playing: true, id: 't1' });
+  coord.requestPlaybackSync({ playing: true, id: 't2' });
+  coord.requestPlaybackSync({ playing: true, id: 't3' });
+  assert.deepEqual(switched, ['t1'], 'later states must wait for the clock without blocking the caller');
+
+  releaseClock();
+  await done;
+  assert.deepEqual(switched, ['t1', 't3']);
+  coord.dispose();
+});
+
+test('AwtrixCoordinator runs only one script install at a time', async () => {
+  let installs = 0;
+  const mockClient = {
+    scripts: {
+      getSource: async () => null,
+      install: async () => {
+        installs++;
+        return {};
+      },
+      getConfig: async () => ({}),
+      updateConfig: async () => {},
+    },
+  };
+  const coord = new AwtrixCoordinator({ host: '192.168.1.50', serverLanUrl: 'http://x:1', client: mockClient });
+
+  await Promise.all([coord.ensureScriptInstalled(), coord.ensureScriptInstalled()]);
+  assert.equal(installs, 1);
+  assert.equal(coord.scriptSynced, true);
+});
+
+test('Dashboard preview reports when the clock itself last polled', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-poll-test-'));
+  const config = loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
+  const awtrix = { appEnabled: true };
+  const server = createBridgeServer({
+    config,
+    spotify: {},
+    awtrix,
+    getCurrentSnapshot: () => ({ playing: false, id: '', progressMs: 0, durationMs: 1, updatedAtMs: Date.now() }),
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const preview = async () => (await fetch(`${base}/api/preview`)).json();
+
+  try {
+    assert.equal((await preview()).clockLastPollAgoMs, null);
+
+    await fetch(`${base}/api/now-playing?art=`);
+    assert.equal((await preview()).clockLastPollAgoMs, null, 'other callers must not count as the clock');
+
+    await fetch(`${base}/api/now-playing?clock=1&art=`);
+    const ago = (await preview()).clockLastPollAgoMs;
+    assert.ok(ago >= 0 && ago < 5000, `Unexpected poll age: ${ago}`);
+
+    assert.equal((await preview()).clockAppHidden, false);
+    awtrix.appEnabled = false;
+    assert.equal((await preview()).clockAppHidden, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('HTTP server sends art only when the clock does not already hold that cover', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-srv-test-'));
   const config = loadConfig({ PORT: '0', DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
   const store = new TokenStore(tmpDir);
@@ -272,21 +385,24 @@ test('HTTP server omits 256-pixel art payload when ?track= matches cached track 
   const awtrix = new AwtrixCoordinator({ host: '', serverLanUrl: config.serverLanUrl });
 
   const fakeArt = new Array(256).fill(0x1db954);
+  const coverId = buildArtId('https://i.scdn.co/image/cover');
+  let snapshot = {
+    playing: true,
+    id: 'abc123',
+    title: 'Veridis Quo',
+    artist: 'Daft Punk',
+    progressMs: 10000,
+    durationMs: 300000,
+    accent: 0x1db954,
+    art: fakeArt,
+    artId: coverId,
+    updatedAtMs: Date.now(),
+  };
   const server = createBridgeServer({
     config,
     spotify,
     awtrix,
-    getCurrentSnapshot: () => ({
-      playing: true,
-      id: 'abc123',
-      title: 'Veridis Quo',
-      artist: 'Daft Punk',
-      progressMs: 10000,
-      durationMs: 300000,
-      accent: 0x1db954,
-      art: fakeArt,
-      updatedAtMs: Date.now(),
-    }),
+    getCurrentSnapshot: () => snapshot,
     triggerImmediatePoll: async () => {},
   });
 
@@ -312,19 +428,35 @@ test('HTTP server omits 256-pixel art payload when ?track= matches cached track 
   }
 
   try {
-    // 1st poll from clock (different or empty track id) -> includes 256-pixel art
-    const r1 = await invokeGet('/api/now-playing?track=');
+    // Clock holds no cover -> includes 256-pixel art
+    const r1 = await invokeGet('/api/now-playing?art=');
     const j1 = JSON.parse(r1.body);
     assert.equal(r1.status, 200);
     assert.equal(j1.id, 'abc123');
+    assert.equal(j1.artId, coverId);
     assert.equal(j1.art.length, 256);
 
-    // 2nd poll from clock (?track=abc123) -> omits art to save Wi-Fi & Berry GC
-    const r2 = await invokeGet('/api/now-playing?track=abc123');
+    // Clock holds this cover -> omits art to save Wi-Fi & Berry GC
+    const r2 = await invokeGet(`/api/now-playing?art=${coverId}`);
     const j2 = JSON.parse(r2.body);
     assert.equal(r2.status, 200);
     assert.equal(j2.id, 'abc123');
+    assert.equal(j2.artId, coverId);
     assert.equal(j2.art, undefined);
+
+    // New track whose cover failed to download -> no art, empty id tells the clock to drop the old cover
+    snapshot = { ...snapshot, id: 'next456', art: null, artId: '' };
+    const r3 = JSON.parse((await invokeGet(`/api/now-playing?art=${coverId}`)).body);
+    assert.equal(r3.id, 'next456');
+    assert.equal(r3.artId, '');
+    assert.equal(r3.art, undefined);
+
+    // Download succeeds on a later poll -> the clock still gets the cover for that same track
+    const retriedId = buildArtId('https://i.scdn.co/image/next');
+    snapshot = { ...snapshot, art: fakeArt, artId: retriedId };
+    const r4 = JSON.parse((await invokeGet('/api/now-playing?art=')).body);
+    assert.equal(r4.artId, retriedId);
+    assert.equal(r4.art.length, 256);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -350,4 +482,15 @@ test('Berry script passes structural balance & AWTRIX NG conventions check', asy
   const closers = (stripped.match(/\bend\b/g) || []).length;
   assert.equal(openers, closers, `Unbalanced Berry blocks: ${openers} openers vs ${closers} 'end's`);
   assert.match(src, /return SpotifyNowPlaying\(\)/);
+});
+
+test('Clock and simulator draw the two text lines on the same baselines', async () => {
+  const berry = await fs.readFile(path.resolve(__dirname, '../berry/spotify_now_playing.be'), 'utf8');
+  assert.match(berry, /draw_scrolling_line\(text_x, 6, avail_w, self\.title,/);
+  assert.match(berry, /draw_scrolling_line\(text_x, 14, avail_w, self\.artist,/);
+
+  const server = await fs.readFile(path.resolve(__dirname, '../src/server.js'), 'utf8');
+  assert.match(server, /drawScrolling\(fb, 17, 6, 35, state\.title/);
+  assert.match(server, /drawScrolling\(fb, 17, 14, 35, state\.artist/);
+  assert.match(server, /baseline - 5 \+ r/);
 });

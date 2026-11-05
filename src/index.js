@@ -1,11 +1,13 @@
 import { loadConfig } from './config.js';
 import { TokenStore } from './store.js';
 import { SpotifyClient } from './spotify.js';
-import { ArtworkProcessor } from './artwork.js';
+import { ArtworkProcessor, buildArtId } from './artwork.js';
 import { AwtrixCoordinator } from './awtrix.js';
 import { createBridgeServer } from './server.js';
 
 const SPOTIFY_GREEN = 0x1db954;
+// After this long without a good Spotify answer, stop claiming the last song is still playing.
+const SPOTIFY_STALE_MS = 60_000;
 
 async function main() {
   const config = loadConfig();
@@ -47,12 +49,25 @@ async function main() {
     durationMs: 1,
     accent: SPOTIFY_GREEN,
     art: null,
+    artId: '',
+    spotifyError: null,
     updatedAtMs: Date.now(),
   };
 
   let pollTimer = null;
   let pollInFlight = false;
   let stopped = false;
+  let lastSpotifyOkMs = Date.now();
+
+  function publishStopped(spotifyError = null) {
+    snapshot = {
+      ...snapshot,
+      playing: false,
+      spotifyError,
+      updatedAtMs: Date.now(),
+    };
+    awtrix.requestPlaybackSync(snapshot);
+  }
 
   async function pollOnce() {
     if (pollInFlight || stopped) return;
@@ -60,6 +75,8 @@ async function main() {
 
     try {
       if (!(await spotify.isAuthorized())) {
+        lastSpotifyOkMs = Date.now();
+        if (snapshot.playing) publishStopped();
         return;
       }
 
@@ -68,14 +85,10 @@ async function main() {
         // Rate-limited (429); keep existing snapshot until backoff expires
         return;
       }
+      lastSpotifyOkMs = Date.now();
 
       if (!track.id) {
-        snapshot = {
-          ...snapshot,
-          playing: false,
-          updatedAtMs: Date.now(),
-        };
-        await awtrix.onPlaybackState(snapshot);
+        publishStopped();
         return;
       }
 
@@ -102,12 +115,19 @@ async function main() {
         durationMs: track.durationMs,
         accent,
         art: pixels,
+        artId: pixels && track.imageUrl ? buildArtId(track.imageUrl) : '',
+        spotifyError: null,
         updatedAtMs: Date.now(),
       };
 
-      await awtrix.onPlaybackState(snapshot);
+      awtrix.requestPlaybackSync(snapshot);
     } catch (err) {
       console.warn(`[poller] Poll error: ${err.message}`);
+      if (snapshot.playing && Date.now() - lastSpotifyOkMs > SPOTIFY_STALE_MS) {
+        publishStopped(err.message);
+      } else {
+        snapshot = { ...snapshot, spotifyError: err.message };
+      }
     } finally {
       pollInFlight = false;
       scheduleNextPoll();
@@ -138,7 +158,8 @@ async function main() {
     console.log(`[awtrix-spotify] Dashboard & API listening on http://127.0.0.1:${config.port}`);
     console.log(`[awtrix-spotify] TC002 LAN endpoint: ${config.serverLanUrl}/api/now-playing`);
 
-    await awtrix.ensureScriptInstalled();
+    // Not awaited: an unreachable clock must not delay the first Spotify poll.
+    awtrix.ensureScriptInstalled();
     await pollOnce();
     scheduleNextPoll();
   });

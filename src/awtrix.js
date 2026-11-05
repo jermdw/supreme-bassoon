@@ -46,6 +46,9 @@ export class AwtrixCoordinator {
     this.pauseTimer = null;
     this.lastError = null;
     this.lastSyncAt = null;
+    this.scriptSyncPromise = null;
+    this.pendingState = null;
+    this.playbackSyncPromise = null;
   }
 
   isConfigured() {
@@ -96,7 +99,15 @@ export class AwtrixCoordinator {
     if (!this.isConfigured() || !this.autoInstallScript || this.scriptSynced) {
       return;
     }
+    if (!this.scriptSyncPromise) {
+      this.scriptSyncPromise = this._syncScript().finally(() => {
+        this.scriptSyncPromise = null;
+      });
+    }
+    return this.scriptSyncPromise;
+  }
 
+  async _syncScript() {
     try {
       const client = await this._getClient();
       const desiredSource = await fs.readFile(this.scriptPath, 'utf8');
@@ -146,6 +157,33 @@ export class AwtrixCoordinator {
     } catch (err) {
       this.lastError = err.message;
       console.warn(`[awtrix] Failed syncing script to ${this.host}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Applies the newest state in the background so a slow or unreachable clock never delays
+   * Spotify polling. States that arrive while one is being applied replace each other.
+   */
+  requestPlaybackSync(state) {
+    this.pendingState = state;
+    if (!this.playbackSyncPromise) {
+      this.playbackSyncPromise = this._drainPlaybackSync().finally(() => {
+        this.playbackSyncPromise = null;
+      });
+    }
+    return this.playbackSyncPromise;
+  }
+
+  async _drainPlaybackSync() {
+    while (this.pendingState) {
+      const state = this.pendingState;
+      this.pendingState = null;
+      try {
+        await this.onPlaybackState(state);
+      } catch (err) {
+        this.lastError = err.message;
+        console.warn(`[awtrix] Failed applying playback state: ${err.message}`);
+      }
     }
   }
 

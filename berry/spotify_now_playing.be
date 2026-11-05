@@ -22,6 +22,8 @@ class SpotifyNowPlaying
   var sync_at_ms
   var track_started_ms
   var art
+  var art_id
+  var fail_since_ms
 
   var badge_text
   var badge_until
@@ -50,6 +52,8 @@ class SpotifyNowPlaying
     self.sync_at_ms = now_ms()
     self.track_started_ms = now_ms()
     self.art = nil
+    self.art_id = ""
+    self.fail_since_ms = nil
 
     self.badge_text = ""
     self.badge_until = 0
@@ -58,19 +62,18 @@ class SpotifyNowPlaying
     timer.every(self.poll_ms, def () self.poll() end)
   end
 
+  def on_show()
+    self.poll()
+  end
+
   def poll()
     if self.in_flight || self.server_url == nil || size(self.server_url) == 0
       return
     end
     self.in_flight = true
 
-    var q_track = ""
-    if self.art != nil && size(self.art) == 256 && size(self.track_id) > 0
-      q_track = self.track_id
-    end
-
-    var url = self.server_url + "/api/now-playing?track=" + q_track
-    http.get(url, def (a, b) self.on_poll_response(a, b) end)
+    var url = self.server_url + "/api/now-playing?clock=1&art=" + self.art_id
+    http.get(url, def (a, b) self.on_poll_response(a, b) end, {"timeout": 5})
   end
 
   def on_poll_response(a, b)
@@ -86,9 +89,15 @@ class SpotifyNowPlaying
       status = b
     end
 
+    # Count failed requests rather than time since the last success: the firmware pauses
+    # this script while the app is disabled, and that pause must not read as an outage.
     if status != 200 || body == nil || size(body) == 0
+      if self.fail_since_ms == nil
+        self.fail_since_ms = now_ms()
+      end
       return
     end
+    self.fail_since_ms = nil
 
     try
       var d = json.load(body)
@@ -113,9 +122,14 @@ class SpotifyNowPlaying
       end
       self.sync_at_ms = now_ms()
 
+      var new_art_id = str(d.find("artId", ""))
       var incoming_art = d.find("art", nil)
-      if incoming_art != nil && size(incoming_art) == 256
+      if size(new_art_id) == 0
+        self.art = nil
+        self.art_id = ""
+      elif incoming_art != nil && size(incoming_art) == 256
         self.art = incoming_art
+        self.art_id = new_art_id
       end
     except ..
       # Ignore malformed transient network payloads
@@ -204,6 +218,7 @@ class SpotifyNowPlaying
 
     var w = width()
     var h = height()
+    var offline = self.fail_since_ms != nil && now_ms() - self.fail_since_ms > 15000
     var text_x = 17
     var avail_w = w - text_x
     if avail_w < 8
@@ -211,17 +226,28 @@ class SpotifyNowPlaying
       text_x = 0
     end
 
-    # 1. Draw Title (top line) and Artist (second line) first
+    # 1. Draw Title (top line) and Artist (second line) first.
+    # The y of text() is the baseline: 6 puts capitals on rows 1-5, 14 on rows 9-13.
     if now_ms() < self.badge_until && size(self.badge_text) > 0
       var bw = text_ink_width(self.badge_text)
       var bx = text_x + (avail_w - bw) / 2
-      text(bx, 4, self.badge_text, 0xFFFFFF)
+      var by = 6
+      if h >= 16
+        by = 10
+      end
+      text(bx, by, self.badge_text, 0xFFFFFF)
     else
       if h >= 16
-        self.draw_scrolling_line(text_x, 1, avail_w, self.title, 0xFFFFFF, 0)
-        self.draw_scrolling_line(text_x, 8, avail_w, self.artist, self.accent, 600)
+        self.draw_scrolling_line(text_x, 6, avail_w, self.title, 0xFFFFFF, 0)
+        if offline
+          text(text_x, 14, "OFFLINE", 0xFFA500)
+        else
+          self.draw_scrolling_line(text_x, 14, avail_w, self.artist, self.accent, 600)
+        end
+      elif offline
+        text(text_x, 6, "OFFLINE", 0xFFA500)
       else
-        self.draw_scrolling_line(text_x, 1, avail_w, self.title + " - " + self.artist, 0xFFFFFF, 0)
+        self.draw_scrolling_line(text_x, 6, avail_w, self.title + " - " + self.artist, 0xFFFFFF, 0)
       end
     end
 
@@ -247,7 +273,7 @@ class SpotifyNowPlaying
     # 3. Interpolated 1px bottom progress bar across text column
     if h >= 16
       var elapsed = self.progress_ms
-      if self.playing
+      if self.playing && !offline
         elapsed += now_ms() - self.sync_at_ms
       end
       if elapsed < 0

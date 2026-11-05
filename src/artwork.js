@@ -1,6 +1,13 @@
+import crypto from 'node:crypto';
+
 const SPOTIFY_GREEN = 0x1db954;
 const ART_SIZE = 16;
 const PIXEL_COUNT = ART_SIZE * ART_SIZE;
+
+/** Identifies a cover so the clock can tell whether it already holds it. */
+export function buildArtId(imageUrl) {
+  return crypto.createHash('sha1').update(imageUrl).digest('hex').slice(0, 12);
+}
 
 export function rgbToHsv(r, g, b) {
   const rn = r / 255;

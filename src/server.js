@@ -203,6 +203,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       <div>${config.spotify.clientId && config.spotify.clientId !== 'your_spotify_client_id_here' ? 'Configured' : '<span style="color:var(--err)">Missing in .env</span>'}</div>
     </div>
     <div class="controls" style="margin-top:1rem;">
+      <div id="spotifyWarn" style="color:var(--warn); width:100%; font-size:0.9rem;"></div>
       <a class="btn" href="/auth/login">${authorized ? 'Reconnect Spotify' : 'Connect Spotify'}</a>
       ${authorized ? `<form method="POST" action="/auth/logout" style="margin:0;"><button class="btn secondary" type="submit">Disconnect</button></form>` : ''}
     </div>
@@ -228,6 +229,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       <div><code>${escapeHtml(config.awtrix.appName)}</code> (${awtrixStatus.scriptSynced ? 'Installed' : 'Pending sync'})</div>
       <div>Bridge Poll URL:</div>
       <div><code>${escapeHtml(config.serverLanUrl)}/api/now-playing</code></div>
+      <div>Clock Last Polled:</div>
+      <div id="clockPoll">Checking…</div>
       ${awtrixStatus.lastError ? `<div>Last Warning:</div><div style="color:var(--warn)">${escapeHtml(awtrixStatus.lastError)}</div>` : ''}
     </div>
   </div>
@@ -259,7 +262,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       fb[y * 52 + x] = colorInt;
     }
 
-    function drawText(fb, x0, y0, str, colorInt) {
+    // baseline matches the clock's text(): the row just below the capitals.
+    function drawText(fb, x0, baseline, str, colorInt) {
       const upper = String(str || '').toUpperCase();
       let cx = x0;
       for (const ch of upper) {
@@ -268,7 +272,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
         for (let r = 0; r < 5; r++) {
           const rowBits = glyph[r];
           for (let c = 0; c < w; c++) {
-            if ((rowBits >> (2 - c)) & 1) setLed(fb, cx + c, y0 + r, colorInt);
+            if ((rowBits >> (2 - c)) & 1) setLed(fb, cx + c, baseline - 5 + r, colorInt);
           }
         }
         cx += w + 1;
@@ -302,8 +306,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
 
     function renderFrame() {
       const fb = new Int32Array(52 * 16).fill(0x090c10);
-      drawScrolling(fb, 17, 1, 35, state.title || 'Spotify', 0xffffff, 0);
-      drawScrolling(fb, 17, 8, 35, state.artist || 'Paused', state.accent || 0x1db954, 600);
+      drawScrolling(fb, 17, 6, 35, state.title || 'Spotify', 0xffffff, 0);
+      drawScrolling(fb, 17, 14, 35, state.artist || 'Paused', state.accent || 0x1db954, 600);
 
       for (let y = 0; y < 16; y++) {
         for (let x = 0; x < 17; x++) setLed(fb, x, y, 0x090c10);
@@ -340,6 +344,22 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       requestAnimationFrame(renderFrame);
     }
 
+    function renderStatus(d) {
+      const clockPollEl = document.getElementById('clockPoll');
+      const ago = d.clockLastPollAgoMs;
+      const seconds = ago === null ? null : Math.round(ago / 1000);
+      // The clock pauses the script while the app is hidden, so silence is expected then.
+      const late = !d.clockAppHidden && (seconds === null || seconds > 15);
+      const when = seconds === null ? 'Not since the bridge started' : seconds + 's ago';
+      if (d.clockAppHidden) {
+        clockPollEl.textContent = when + ' (paused while nothing is playing)';
+      } else {
+        clockPollEl.textContent = late ? when + ' — check SERVER_LAN_URL, the published port, and your firewall' : when;
+      }
+      clockPollEl.style.color = late ? 'var(--warn)' : '';
+      document.getElementById('spotifyWarn').textContent = d.spotifyError ? 'Spotify problem: ' + d.spotifyError : '';
+    }
+
     async function pollPreview() {
       try {
         const r = await fetch('/api/preview');
@@ -347,6 +367,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
           const d = await r.json();
           state = { ...d, fetchedAt: performance.now() };
           metaEl.textContent = d.playing ? (d.artist + ' — ' + d.title) : 'Paused / Idle';
+          renderStatus(d);
         }
       } catch {}
     }
@@ -365,6 +386,8 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
 }
 
 export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot, triggerImmediatePoll, onAuthorized }) {
+  let lastClockPollMs = null;
+
   return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
@@ -375,9 +398,13 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
       }
 
       if (pathname === '/api/now-playing' && req.method === 'GET') {
-        const clientTrackId = url.searchParams.get('track') || '';
+        if (url.searchParams.has('clock')) {
+          lastClockPollMs = Date.now();
+        }
+        const clientArtId = url.searchParams.get('art') || '';
         const snap = getCurrentSnapshot();
-        const includeArt = Boolean(snap.art && snap.id && snap.id !== clientTrackId);
+        const artId = snap.artId || '';
+        const includeArt = Boolean(snap.art && artId && artId !== clientArtId);
         const payload = {
           playing: snap.playing,
           id: snap.id,
@@ -388,6 +415,7 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
             : snap.progressMs,
           durationMs: snap.durationMs,
           accent: snap.accent,
+          artId,
         };
         if (includeArt) {
           payload.art = snap.art;
@@ -402,6 +430,8 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
           progressMs: snap.playing
             ? Math.min(snap.durationMs, snap.progressMs + Math.max(0, Date.now() - snap.updatedAtMs))
             : snap.progressMs,
+          clockLastPollAgoMs: lastClockPollMs === null ? null : Date.now() - lastClockPollMs,
+          clockAppHidden: awtrix.appEnabled === false,
         });
       }
 
