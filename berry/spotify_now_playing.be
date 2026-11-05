@@ -30,6 +30,7 @@ class SpotifyNowPlaying
   var paused
   var shown
   var holding
+  var state_hold_until
   var idle_ticks
   var art
   var art_id
@@ -68,6 +69,7 @@ class SpotifyNowPlaying
     self.paused = false
     self.shown = false
     self.holding = false
+    self.state_hold_until = 0
     self.idle_ticks = 0
     self.art = nil
     self.art_id = ""
@@ -165,9 +167,12 @@ class SpotifyNowPlaying
         return
       end
 
-      self.playing = d.find("playing", false)
       self.visible = d.find("visible", false)
-      self.paused = d.find("paused", false)
+      # Spotify takes a moment to report a button press, so don't flip back in the meantime.
+      if now_ms() >= self.state_hold_until
+        self.playing = d.find("playing", false)
+        self.paused = d.find("paused", false)
+      end
       var new_id = str(d.find("id", ""))
       if new_id != self.track_id
         self.track_id = new_id
@@ -207,8 +212,22 @@ class SpotifyNowPlaying
     end
     self.badge_text = label
     self.badge_until = now_ms() + 1000
+    self.state_hold_until = now_ms() + 1500
     var url = self.server_url + "/api/action/" + action + "?token=" + self.token
-    http.get(url, def (a, b) self.poll() end)
+    http.get(url, def (a, b) self.on_action_response(a, b) end, {"timeout": 5})
+  end
+
+  def on_action_response(a, b)
+    var status = b
+    if type(a) == "int"
+      status = a
+    end
+    if status < 200 || status >= 300
+      self.badge_text = "FAILED"
+      self.badge_until = now_ms() + 1500
+      self.state_hold_until = 0
+    end
+    self.poll()
   end
 
   def on_button(btn)

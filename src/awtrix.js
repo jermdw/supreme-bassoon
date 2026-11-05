@@ -27,6 +27,7 @@ export class AwtrixCoordinator {
     serverLanUrl,
     pollActiveMs = 2000,
     clockToken = '',
+    scriptRecheckMs = 300_000,
     scriptPath = DEFAULT_SCRIPT_PATH,
     client = null,
   }) {
@@ -42,6 +43,8 @@ export class AwtrixCoordinator {
     this.serverLanUrl = serverLanUrl;
     this.pollActiveMs = pollActiveMs;
     this.clockToken = clockToken;
+    this.scriptRecheckMs = scriptRecheckMs;
+    this.lastScriptCheckMs = 0;
     this.scriptPath = scriptPath;
     this.client = client;
 
@@ -114,7 +117,11 @@ export class AwtrixCoordinator {
   }
 
   async ensureScriptInstalled() {
-    if (!this.isConfigured() || !this.autoInstallScript || this.scriptSynced) {
+    if (!this.isConfigured() || !this.autoInstallScript) {
+      return;
+    }
+    // Recheck now and then, since a wiped or reset clock loses the script.
+    if (this.scriptSynced && Date.now() - this.lastScriptCheckMs < this.scriptRecheckMs) {
       return;
     }
     if (!this.scriptSyncPromise) {
@@ -130,27 +137,14 @@ export class AwtrixCoordinator {
       const client = await this._getClient();
       const desiredSource = await fs.readFile(this.scriptPath, 'utf8');
 
-      // A script installed while its app is off never starts its timers once switched on, even
-      // though it draws and reports as enabled (seen on 1.1.2). So this has to come first.
-      await this._ensureEnabled(client);
-
       let existingSource = null;
       try {
         const res = await client.scripts.getSource(this.appName);
         existingSource = typeof res === 'string' ? res : res?.source ?? null;
-      } catch {
-        // Script not installed yet
+      } catch (err) {
+        if (err?.status !== 404) throw err; // A blip must not trigger a reinstall
       }
-
-      if (existingSource !== desiredSource) {
-        const installRes = await client.scripts.install(this.appName, desiredSource);
-        if (installRes?.error) {
-          throw new Error(
-            `Berry compile error (line ${installRes.error.line}): ${installRes.error.message}`
-          );
-        }
-        console.log(`[awtrix] Installed Berry script "${this.appName}" on ${this.host}`);
-      }
+      const needsInstall = existingSource !== desiredSource;
 
       // Saving the config restarts the script, so only do it when a value differs.
       const desiredConfig = {
@@ -164,8 +158,24 @@ export class AwtrixCoordinator {
         const { fields = [] } = await client.scripts.getConfig(this.appName);
         const current = Object.fromEntries(fields.map((field) => [field.key, field.value]));
         needsConfigUpdate = Object.entries(desiredConfig).some(([key, value]) => current[key] !== value);
-      } catch {
-        // Proceed with updateConfig
+      } catch (err) {
+        if (err?.status !== 404) throw err;
+      }
+
+      // A script installed while its app is off never starts its timers once switched on, even
+      // though it draws and reports as enabled (seen on 1.1.2). So this has to come first.
+      if (needsInstall || needsConfigUpdate) {
+        await this._ensureEnabled(client);
+      }
+
+      if (needsInstall) {
+        const installRes = await client.scripts.install(this.appName, desiredSource);
+        if (installRes?.error) {
+          throw new Error(
+            `Berry compile error (line ${installRes.error.line}): ${installRes.error.message}`
+          );
+        }
+        console.log(`[awtrix] Installed Berry script "${this.appName}" on ${this.host}`);
       }
 
       if (needsConfigUpdate) {
@@ -180,6 +190,8 @@ export class AwtrixCoordinator {
     } catch (err) {
       this.lastError = err.message;
       this.warnings.warn('sync', `[awtrix] Failed syncing script to ${this.host}: ${err.message}`);
+    } finally {
+      this.lastScriptCheckMs = Date.now();
     }
   }
 

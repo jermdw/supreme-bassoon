@@ -50,9 +50,25 @@ function escapeHtml(str) {
     .replaceAll('"', '&quot;');
 }
 
+/** Loopback, or the address Docker gives the container when SERVER_LAN_URL is left unset. */
+export function isUnreachableLanUrl(lanUrl) {
+  let host;
+  try {
+    host = new URL(lanUrl).hostname;
+  } catch {
+    return true;
+  }
+  return (
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host === '[::1]' ||
+    /^127\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  );
+}
+
 function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', error = '' }) {
-  const isLoopbackLan =
-    config.serverLanUrl.includes('127.0.0.1') || config.serverLanUrl.includes('localhost');
+  const isLoopbackLan = isUnreachableLanUrl(config.serverLanUrl);
   const usesLocalhostRedirect = config.spotify.redirectUri.includes('://localhost');
 
   return `<!DOCTYPE html>
@@ -206,6 +222,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
     </div>
     <div class="controls" style="margin-top:1rem;">
       <div id="spotifyWarn" style="color:var(--warn); width:100%; font-size:0.9rem;"></div>
+      <div id="actionWarn" style="color:var(--warn); width:100%; font-size:0.9rem;"></div>
       <a class="btn" href="/auth/login">${authorized ? 'Reconnect Spotify' : 'Connect Spotify'}</a>
       ${authorized ? `<form method="POST" action="/auth/logout" style="margin:0;"><button class="btn secondary" type="submit">Disconnect</button></form>` : ''}
     </div>
@@ -228,7 +245,7 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       <div>Clock Host:</div>
       <div><code>${escapeHtml(config.awtrix.host || 'Not set')}</code></div>
       <div>Script App Name:</div>
-      <div><code>${escapeHtml(config.awtrix.appName)}</code> (${awtrixStatus.scriptSynced ? 'Installed' : 'Pending sync'})</div>
+      <div><code>${escapeHtml(config.awtrix.appName)}</code> (${!config.awtrix.autoInstallScript ? 'Installed manually' : awtrixStatus.scriptSynced ? 'Installed' : 'Pending sync'})</div>
       <div>Bridge Poll URL:</div>
       <div><code>${escapeHtml(config.serverLanUrl)}/api/now-playing</code></div>
       <div>Clock Last Polled:</div>
@@ -376,7 +393,14 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
     }
 
     async function act(name) {
-      await fetch('/api/action/' + name, { method: 'POST' });
+      const warnEl = document.getElementById('actionWarn');
+      try {
+        const r = await fetch('/api/action/' + name, { method: 'POST' });
+        const d = await r.json();
+        warnEl.textContent = r.ok ? '' : 'Command failed: ' + d.error;
+      } catch {
+        warnEl.textContent = 'Command failed: the bridge did not answer';
+      }
       setTimeout(pollPreview, 350);
     }
 
@@ -471,7 +495,13 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
           return sendJson(res, 400, { error: 'Invalid action' });
         }
 
-        await spotify.controlPlayback(resolvedAction);
+        const result = await spotify.controlPlayback(resolvedAction);
+        if (result.status >= 300) {
+          const detail = result.status === 404
+            ? 'No active Spotify device. Start playing on a device first.'
+            : result.data?.error?.message || `Spotify answered HTTP ${result.status}`;
+          return sendJson(res, result.status, { error: detail, action: resolvedAction });
+        }
         setTimeout(() => {
           triggerImmediatePoll().catch(() => {});
         }, 250);
