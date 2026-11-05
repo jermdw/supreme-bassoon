@@ -13,7 +13,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "awtrix-ng-api": ">=0.5.0",
-    "sharp": ">=0.33.5"
+    "awtrix-ng-api": "^0.5.0",
+    "sharp": "^0.35.5"
   }
 }

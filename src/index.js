@@ -1,9 +1,11 @@
 import { loadConfig } from './config.js';
-import { TokenStore } from './store.js';
+import { TokenStore, loadOrCreateClockToken } from './store.js';
 import { SpotifyClient } from './spotify.js';
 import { ArtworkProcessor, buildArtId } from './artwork.js';
 import { AwtrixCoordinator } from './awtrix.js';
 import { createBridgeServer } from './server.js';
+import { RepeatLimiter } from './logging.js';
+import { nextPollDelay } from './playback.js';
 
 const SPOTIFY_GREEN = 0x1db954;
 // After this long without a good Spotify answer, stop claiming the last song is still playing.
@@ -12,6 +14,10 @@ const SPOTIFY_STALE_MS = 60_000;
 async function main() {
   const config = loadConfig();
   const tokenStore = new TokenStore(config.dataDir);
+  const clockToken = await loadOrCreateClockToken(config.dataDir);
+  if (!config.awtrix.autoInstallScript) {
+    console.log(`[awtrix-spotify] AUTO_INSTALL_SCRIPT is off: set the script's Bridge Token field to ${clockToken}`);
+  }
 
   const spotify = new SpotifyClient({
     clientId: config.spotify.clientId,
@@ -34,9 +40,11 @@ async function main() {
     appName: config.awtrix.appName,
     autoInstallScript: config.awtrix.autoInstallScript,
     switchOnTrackChange: config.awtrix.switchOnTrackChange,
-    pauseGraceMs: config.polling.pauseGraceMs,
+    pausedScreenMs: config.polling.pausedScreenMs,
+    keepOnScreen: config.awtrix.keepOnScreen,
     serverLanUrl: config.serverLanUrl,
     pollActiveMs: config.polling.activeMs,
+    clockToken,
   });
 
   let snapshot = {
@@ -51,6 +59,7 @@ async function main() {
     art: null,
     artId: '',
     spotifyError: null,
+    pausedAtMs: null,
     updatedAtMs: Date.now(),
   };
 
@@ -58,11 +67,14 @@ async function main() {
   let pollInFlight = false;
   let stopped = false;
   let lastSpotifyOkMs = Date.now();
+  let lastPlayingMs = Date.now();
+  const pollWarnings = new RepeatLimiter();
 
   function publishStopped(spotifyError = null) {
     snapshot = {
       ...snapshot,
       playing: false,
+      pausedAtMs: null,
       spotifyError,
       updatedAtMs: Date.now(),
     };
@@ -86,6 +98,7 @@ async function main() {
         return;
       }
       lastSpotifyOkMs = Date.now();
+      pollWarnings.recovered('spotify', '[poller] Spotify reachable again');
 
       if (!track.id) {
         publishStopped();
@@ -117,12 +130,14 @@ async function main() {
         art: pixels,
         artId: pixels && track.imageUrl ? buildArtId(track.imageUrl) : '',
         spotifyError: null,
+        pausedAtMs: track.playing ? null : snapshot.pausedAtMs || Date.now(),
         updatedAtMs: Date.now(),
       };
+      if (track.playing) lastPlayingMs = Date.now();
 
       awtrix.requestPlaybackSync(snapshot);
     } catch (err) {
-      console.warn(`[poller] Poll error: ${err.message}`);
+      pollWarnings.warn('spotify', `[poller] Poll error: ${err.message}`);
       if (snapshot.playing && Date.now() - lastSpotifyOkMs > SPOTIFY_STALE_MS) {
         publishStopped(err.message);
       } else {
@@ -137,7 +152,12 @@ async function main() {
   function scheduleNextPoll() {
     if (stopped) return;
     if (pollTimer) clearTimeout(pollTimer);
-    const delay = snapshot.playing ? config.polling.activeMs : config.polling.idleMs;
+    const delay = nextPollDelay({
+      playing: snapshot.playing,
+      lastPlayingMs,
+      nowMs: Date.now(),
+      polling: config.polling,
+    });
     pollTimer = setTimeout(() => {
       pollOnce().catch(() => {});
     }, delay);
@@ -145,6 +165,7 @@ async function main() {
 
   const server = createBridgeServer({
     config,
+    clockToken,
     spotify,
     awtrix,
     getCurrentSnapshot: () => snapshot,
@@ -169,7 +190,6 @@ async function main() {
     stopped = true;
     console.log(`[awtrix-spotify] Caught ${signal}, shutting down...`);
     if (pollTimer) clearTimeout(pollTimer);
-    awtrix.dispose();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
   }

@@ -1,4 +1,6 @@
 # @config server_url text "Bridge Server URL" default="http://192.168.1.100:8765" help="LAN URL of your awtrix-spotify Docker container"
+# @config token text "Bridge Token" default="" help="Set automatically by the bridge; lets the clock's buttons send playback commands"
+# @config keep_on_screen bool "Keep On Screen" default=false help="Stay on this app while music plays instead of rotating away"
 # @config poll_ms number "Poll Interval (ms)" default=2000 min=1000 max=10000
 # @config scroll_speed number "Scroll Speed (ms/px)" default=45 min=20 max=120
 # @config lr_controls bool "Left/Right Skip Tracks" default=false help="Use clock Left/Right buttons for Prev/Next track instead of switching apps"
@@ -7,9 +9,11 @@ import json
 
 class SpotifyNowPlaying
   var server_url
+  var token
   var poll_ms
   var scroll_speed
   var lr_controls
+  var keep_on_screen
 
   var in_flight
   var playing
@@ -20,7 +24,13 @@ class SpotifyNowPlaying
   var progress_ms
   var duration_ms
   var sync_at_ms
-  var track_started_ms
+  var scroll_started_ms
+  var wipe_started_ms
+  var visible
+  var paused
+  var shown
+  var holding
+  var idle_ticks
   var art
   var art_id
   var fail_since_ms
@@ -30,9 +40,11 @@ class SpotifyNowPlaying
 
   def init()
     self.server_url = store.get("server_url", "http://192.168.1.100:8765")
+    self.token = store.get("token", "")
     self.poll_ms = store.get("poll_ms", 2000)
     self.scroll_speed = store.get("scroll_speed", 45)
     self.lr_controls = store.get("lr_controls", false)
+    self.keep_on_screen = store.get("keep_on_screen", false)
 
     if self.poll_ms == nil || self.poll_ms < 1000
       self.poll_ms = 2000
@@ -50,7 +62,13 @@ class SpotifyNowPlaying
     self.progress_ms = 0
     self.duration_ms = 1
     self.sync_at_ms = now_ms()
-    self.track_started_ms = now_ms()
+    self.scroll_started_ms = now_ms()
+    self.wipe_started_ms = 0
+    self.visible = false
+    self.paused = false
+    self.shown = false
+    self.holding = false
+    self.idle_ticks = 0
     self.art = nil
     self.art_id = ""
     self.fail_since_ms = nil
@@ -58,12 +76,55 @@ class SpotifyNowPlaying
     self.badge_text = ""
     self.badge_until = 0
 
+    # A pause outlives the script that set it, so clear one left by an earlier install.
+    rotation.resume()
+
     self.poll()
-    timer.every(self.poll_ms, def () self.poll() end)
+    timer.every(self.poll_ms, def () self.tick() end)
+  end
+
+  def tick()
+    if self.visible || self.shown
+      self.poll()
+      return
+    end
+    # Nothing to show: check in less often. The bridge switches to this app when music starts.
+    self.idle_ticks += 1
+    if self.idle_ticks >= 5
+      self.idle_ticks = 0
+      self.poll()
+    end
+  end
+
+  def is_offline()
+    return self.fail_since_ms != nil && now_ms() - self.fail_since_ms > 15000
+  end
+
+  def should_show()
+    return self.visible && !self.is_offline()
   end
 
   def on_show()
+    self.shown = true
+    self.scroll_started_ms = now_ms()
+    self.update_hold()
     self.poll()
+  end
+
+  def on_hide()
+    self.shown = false
+    self.update_hold()
+  end
+
+  # Any move through the API or buttons ends a pause, so this runs again on every poll.
+  def update_hold()
+    if self.keep_on_screen && self.shown && self.playing && !self.is_offline()
+      rotation.pause()
+      self.holding = true
+    elif self.holding
+      rotation.resume()
+      self.holding = false
+    end
   end
 
   def poll()
@@ -89,12 +150,11 @@ class SpotifyNowPlaying
       status = b
     end
 
-    # Count failed requests rather than time since the last success: the firmware pauses
-    # this script while the app is disabled, and that pause must not read as an outage.
     if status != 200 || body == nil || size(body) == 0
       if self.fail_since_ms == nil
         self.fail_since_ms = now_ms()
       end
+      self.update_hold()
       return
     end
     self.fail_since_ms = nil
@@ -106,10 +166,13 @@ class SpotifyNowPlaying
       end
 
       self.playing = d.find("playing", false)
+      self.visible = d.find("visible", false)
+      self.paused = d.find("paused", false)
       var new_id = str(d.find("id", ""))
       if new_id != self.track_id
         self.track_id = new_id
-        self.track_started_ms = now_ms()
+        self.scroll_started_ms = now_ms()
+        self.wipe_started_ms = now_ms()
       end
 
       self.title = str(d.find("title", "Spotify"))
@@ -130,10 +193,12 @@ class SpotifyNowPlaying
       elif incoming_art != nil && size(incoming_art) == 256
         self.art = incoming_art
         self.art_id = new_art_id
+        self.wipe_started_ms = now_ms()
       end
     except ..
       # Ignore malformed transient network payloads
     end
+    self.update_hold()
   end
 
   def trigger_action(action, label)
@@ -142,7 +207,7 @@ class SpotifyNowPlaying
     end
     self.badge_text = label
     self.badge_until = now_ms() + 1000
-    var url = self.server_url + "/api/action/" + action
+    var url = self.server_url + "/api/action/" + action + "?token=" + self.token
     http.get(url, def (a, b) self.poll() end)
   end
 
@@ -150,9 +215,13 @@ class SpotifyNowPlaying
     if btn == "select"
       if self.playing
         self.playing = false
+        self.paused = true
+        self.update_hold()
         self.trigger_action("pause", "PAUSE")
       else
         self.playing = true
+        self.paused = false
+        self.update_hold()
         self.trigger_action("play", "PLAY")
       end
       return true
@@ -187,7 +256,7 @@ class SpotifyNowPlaying
     var hold_ms = 1500 + phase_offset
     var move_ms = span * self.scroll_speed
     var cycle_ms = hold_ms + move_ms
-    var age_ms = now_ms() - self.track_started_ms
+    var age_ms = now_ms() - self.scroll_started_ms
     if age_ms < 0
       age_ms = 0
     end
@@ -218,7 +287,7 @@ class SpotifyNowPlaying
 
     var w = width()
     var h = height()
-    var offline = self.fail_since_ms != nil && now_ms() - self.fail_since_ms > 15000
+    var offline = self.is_offline()
     var text_x = 17
     var avail_w = w - text_x
     if avail_w < 8
@@ -260,6 +329,9 @@ class SpotifyNowPlaying
           for px : 0 .. 15
             var c = self.art[idx]
             if c > 0
+              if self.paused
+                c = (c >> 1) & 0x7F7F7F
+              end
               pixel(px, py, c)
             end
             idx += 1
@@ -267,6 +339,17 @@ class SpotifyNowPlaying
         end
       else
         self.draw_fallback_icon()
+      end
+
+      # Track change: reveal the new cover from the left over 400ms.
+      var reveal = (now_ms() - self.wipe_started_ms) / 25
+      if reveal >= 0 && reveal < 16
+        rect_fill(reveal, 0, 16 - reveal, 16, 0x000000)
+      end
+
+      if self.paused
+        rect_fill(5, 4, 2, 8, 0xFFFFFF)
+        rect_fill(9, 4, 2, 8, 0xFFFFFF)
       end
     end
 

@@ -7,10 +7,12 @@ import { fileURLToPath } from 'node:url';
 
 import { processRgb16x16, ArtworkProcessor, buildArtId } from '../src/artwork.js';
 import { SpotifyClient, sanitizeMatrixText, pickSmallestCoverImage, buildSafeTrackId } from '../src/spotify.js';
-import { TokenStore } from '../src/store.js';
+import { TokenStore, loadOrCreateClockToken } from '../src/store.js';
 import { AwtrixCoordinator } from '../src/awtrix.js';
 import { createBridgeServer } from '../src/server.js';
 import { loadConfig } from '../src/config.js';
+import { RepeatLimiter } from '../src/logging.js';
+import { isClockVisible, nextPollDelay } from '../src/playback.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -159,8 +161,9 @@ test('SpotifyClient refreshes expired tokens, persists rotated refresh_token, an
   }
 });
 
-test('AwtrixCoordinator enables app, switches on track change, and hides on pause', async () => {
+test('AwtrixCoordinator enables the app before installing and switches only when needed', async () => {
   const actions = [];
+  let appOn = false;
   const mockClient = {
     scripts: {
       getSource: async () => null,
@@ -174,7 +177,9 @@ test('AwtrixCoordinator enables app, switches on track change, and hides on paus
       },
     },
     apps: {
+      list: async () => [{ name: 'spotify', enabled: appOn }],
       setEnabled: async (name, enabled) => {
+        appOn = enabled;
         actions.push(['setEnabled', name, enabled]);
       },
       switchTo: async (name) => {
@@ -186,29 +191,35 @@ test('AwtrixCoordinator enables app, switches on track change, and hides on paus
   const coord = new AwtrixCoordinator({
     host: '192.168.1.50',
     appName: 'spotify',
-    pauseGraceMs: 0,
+    pausedScreenMs: 60_000,
     serverLanUrl: 'http://192.168.1.100:8765',
     client: mockClient,
   });
+  const song = (id, extra = {}) => ({ playing: true, id, title: 'Song', artist: 'Artist', ...extra });
 
-  // Track 1 starts playing -> installs once, enables, switches
-  await coord.onPlaybackState({ playing: true, id: 't1', title: 'Song 1', artist: 'Artist 1' });
-  // Same track polled again -> no duplicate enable or switchTo
-  await coord.onPlaybackState({ playing: true, id: 't1', title: 'Song 1', artist: 'Artist 1' });
-  // Track 2 starts -> switches to app without re-enabling
-  await coord.onPlaybackState({ playing: true, id: 't2', title: 'Song 2', artist: 'Artist 2' });
-  // Paused -> disables app from rotation
-  await coord.onPlaybackState({ playing: false, id: 't2', title: 'Song 2', artist: 'Artist 2' });
+  // Nothing playing yet -> installs and enables, so the script can poll, without switching
+  await coord.onPlaybackState({ playing: false, id: '' });
+  // Starts playing -> switches
+  await coord.onPlaybackState(song('t1'));
+  // Same track polled again -> no duplicate
+  await coord.onPlaybackState(song('t1'));
+  // Next track -> switches
+  await coord.onPlaybackState(song('t2'));
+  // Paused, then resumed while still on show -> no switch
+  await coord.onPlaybackState(song('t2', { playing: false, pausedAtMs: Date.now() }));
+  await coord.onPlaybackState(song('t2'));
+  // Paused too long, then resumed -> switches again
+  await coord.onPlaybackState(song('t2', { playing: false, pausedAtMs: Date.now() - 120_000 }));
+  await coord.onPlaybackState(song('t2'));
 
   assert.deepEqual(actions, [
+    ['setEnabled', 'spotify', true], // Must come before install: see _syncScript
     ['install', 'spotify'],
     ['updateConfig', 'spotify', 'http://192.168.1.100:8765'],
-    ['setEnabled', 'spotify', true],
     ['switchTo', 'spotify'],
     ['switchTo', 'spotify'],
-    ['setEnabled', 'spotify', false],
+    ['switchTo', 'spotify'],
   ]);
-  coord.dispose();
 });
 
 test('AwtrixCoordinator falls back to the order route on firmware without the enable route', async () => {
@@ -294,8 +305,9 @@ test('AwtrixCoordinator applies playback state in the background and keeps only 
   });
   const mockClient = {
     apps: {
-      setEnabled: async () => {
+      list: async () => {
         await clockBlocked;
+        return [{ name: 'spotify', enabled: true }];
       },
       switchTo: async () => {},
     },
@@ -315,12 +327,12 @@ test('AwtrixCoordinator applies playback state in the background and keeps only 
   releaseClock();
   await done;
   assert.deepEqual(switched, ['t1', 't3']);
-  coord.dispose();
 });
 
 test('AwtrixCoordinator runs only one script install at a time', async () => {
   let installs = 0;
   const mockClient = {
+    apps: { list: async () => [] },
     scripts: {
       getSource: async () => null,
       install: async () => {
@@ -341,7 +353,7 @@ test('AwtrixCoordinator runs only one script install at a time', async () => {
 test('Dashboard preview reports when the clock itself last polled', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-poll-test-'));
   const config = loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' });
-  const awtrix = { appEnabled: true };
+  const awtrix = {};
   const server = createBridgeServer({
     config,
     spotify: {},
@@ -363,9 +375,6 @@ test('Dashboard preview reports when the clock itself last polled', async () => 
     const ago = (await preview()).clockLastPollAgoMs;
     assert.ok(ago >= 0 && ago < 5000, `Unexpected poll age: ${ago}`);
 
-    assert.equal((await preview()).clockAppHidden, false);
-    awtrix.appEnabled = false;
-    assert.equal((await preview()).clockAppHidden, true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await fs.rm(tmpDir, { recursive: true, force: true });
@@ -493,4 +502,273 @@ test('Clock and simulator draw the two text lines on the same baselines', async 
   assert.match(server, /drawScrolling\(fb, 17, 6, 35, state\.title/);
   assert.match(server, /drawScrolling\(fb, 17, 14, 35, state\.artist/);
   assert.match(server, /baseline - 5 \+ r/);
+});
+
+async function withSecurityServer(run) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-sec-test-'));
+  const actions = [];
+  const exchanges = [];
+  let cleared = 0;
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir, SERVER_LAN_URL: 'http://192.168.1.100:8765' }),
+    spotify: {
+      controlPlayback: async (action) => actions.push(action),
+      exchangeCode: async (...args) => exchanges.push(args),
+      tokenStore: { clear: async () => cleared++ },
+    },
+    awtrix: {},
+    getCurrentSnapshot: () => ({ playing: true, id: '', progressMs: 0, durationMs: 1, updatedAtMs: Date.now() }),
+    triggerImmediatePoll: async () => {},
+    clockToken: 'secret-token',
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await run({ base, actions, exchanges, getCleared: () => cleared });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+test('Playback commands need the clock token or a same-origin POST', async () => {
+  await withSecurityServer(async ({ base, actions }) => {
+    const status = async (urlPath, init) => (await fetch(base + urlPath, { redirect: 'manual', ...init })).status;
+
+    assert.equal(await status('/api/action/next'), 403);
+    assert.equal(await status('/api/action/next?token=wrong'), 403);
+    assert.equal(await status('/api/action/next?token='), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST' }), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST', headers: { Origin: 'https://evil.example' } }), 403);
+    assert.equal(await status('/api/action/next', { method: 'POST', headers: { Origin: 'null' } }), 403);
+    assert.deepEqual(actions, [], 'rejected requests must not reach Spotify');
+
+    assert.equal(await status('/api/action/next?token=secret-token'), 200);
+    assert.equal(await status('/api/action/toggle', { method: 'POST', headers: { Origin: base } }), 200);
+    assert.deepEqual(actions, ['next', 'pause']);
+  });
+});
+
+test('Playback commands are refused when the server has no clock token', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-sec-test-'));
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir }),
+    spotify: { controlPlayback: async () => assert.fail('must not reach Spotify') },
+    awtrix: {},
+    getCurrentSnapshot: () => ({ playing: false }),
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/action/next?token=`);
+    assert.equal(res.status, 403);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Sign-in forms reject posts from other sites', async () => {
+  await withSecurityServer(async ({ base, exchanges, getCleared }) => {
+    const post = (urlPath, origin) =>
+      fetch(base + urlPath, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(origin ? { Origin: origin } : {}) },
+        body: 'callbackUrl=attacker-code',
+      });
+
+    assert.equal((await post('/auth/logout', 'https://evil.example')).status, 403);
+    assert.equal((await post('/auth/manual-callback', 'https://evil.example')).status, 403);
+    assert.equal(getCleared(), 0);
+    assert.deepEqual(exchanges, []);
+
+    assert.equal((await post('/auth/manual-callback', base)).status, 302);
+    assert.deepEqual(exchanges, [['attacker-code', null]]);
+    assert.equal((await post('/auth/logout', base)).status, 302);
+    assert.equal(getCleared(), 1);
+  });
+});
+
+test('Browser sign-in callback passes state and requires it', async () => {
+  await withSecurityServer(async ({ base, exchanges }) => {
+    await fetch(`${base}/callback?code=c1&state=s1`, { redirect: 'manual' });
+    assert.deepEqual(exchanges, [['c1', 's1', { requireState: true }]]);
+  });
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-state-test-'));
+  try {
+    let tokenRequests = 0;
+    const client = new SpotifyClient({
+      clientId: 'cid',
+      clientSecret: 'sec',
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      tokenStore: new TokenStore(tmpDir),
+      fetchFn: async () => {
+        tokenRequests++;
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ access_token: 'a', refresh_token: 'r', expires_in: 3600 }),
+        };
+      },
+    });
+    const opts = { requireState: true };
+
+    await assert.rejects(client.exchangeCode('code', 'anything', opts), /state mismatch/, 'no sign-in was started');
+    const state = new URL(client.createAuthorizeUrl()).searchParams.get('state');
+    await assert.rejects(client.exchangeCode('code', null, opts), /state mismatch/);
+    await assert.rejects(client.exchangeCode('code', 'wrong', opts), /state mismatch/);
+    assert.equal(tokenRequests, 0);
+
+    await client.exchangeCode('code', state, opts);
+    assert.equal(tokenRequests, 1);
+    await assert.rejects(client.exchangeCode('code', state, opts), /state mismatch/, 'state is single use');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Clock token persists across restarts and reaches the clock', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-token-test-'));
+  try {
+    const dataDir = path.join(tmpDir, 'nested');
+    const token = await loadOrCreateClockToken(dataDir);
+    assert.match(token, /^[0-9a-f]{32}$/);
+    assert.equal(await loadOrCreateClockToken(dataDir), token);
+
+    const updates = [];
+    let configToken = 'old';
+    const makeCoord = () => new AwtrixCoordinator({
+      host: '192.168.1.50',
+      serverLanUrl: 'http://x:1',
+      clockToken: token,
+      client: {
+        apps: { list: async () => [] },
+        scripts: {
+          getSource: async () => null,
+          install: async () => ({}),
+          getConfig: async () => ({
+            fields: [
+              { key: 'server_url', value: 'http://x:1' },
+              { key: 'poll_ms', value: 2000 },
+              { key: 'token', value: configToken },
+              { key: 'keep_on_screen', value: false },
+            ],
+          }),
+          updateConfig: async (_name, cfg) => updates.push(cfg),
+        },
+      },
+    });
+    await makeCoord().ensureScriptInstalled();
+    assert.equal(updates.length, 1, 'a stale token must trigger a config update');
+    assert.equal(updates[0].token, token);
+
+    configToken = token;
+    await makeCoord().ensureScriptInstalled();
+    assert.equal(updates.length, 1, 'a matching config must not restart the script');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Berry script sends the token with button commands', async () => {
+  const script = await fs.readFile(new URL('../berry/spotify_now_playing.be', import.meta.url), 'utf8');
+  assert.match(script, /# @config token text/);
+  assert.match(script, /"\/api\/action\/" \+ action \+ "\?token=" \+ self\.token/);
+});
+
+test('Clock stays visible while playing and for the paused window only', () => {
+  const now = 1_000_000;
+  assert.equal(isClockVisible({ playing: true }, now, 5000), true);
+  assert.equal(isClockVisible({ playing: false, pausedAtMs: null }, now, 5000), false);
+  assert.equal(isClockVisible({ playing: false, pausedAtMs: now - 4999 }, now, 5000), true);
+  assert.equal(isClockVisible({ playing: false, pausedAtMs: now - 5000 }, now, 5000), false);
+  assert.equal(isClockVisible({ playing: false, pausedAtMs: now }, now, 0), false);
+});
+
+test('Now-playing response tells the clock when to take a turn', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'awtrix-visible-test-'));
+  let snap = { playing: false, id: 't1', progressMs: 0, durationMs: 1, updatedAtMs: Date.now(), pausedAtMs: Date.now() };
+  const server = createBridgeServer({
+    config: loadConfig({ DATA_DIR: tmpDir, PAUSED_SCREEN_MS: '60000' }),
+    spotify: {},
+    awtrix: {},
+    getCurrentSnapshot: () => snap,
+    triggerImmediatePoll: async () => {},
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const nowPlaying = async () => (await fetch(`http://127.0.0.1:${server.address().port}/api/now-playing`)).json();
+  try {
+    let d = await nowPlaying();
+    assert.deepEqual([d.playing, d.paused, d.visible], [false, true, true]);
+    snap = { ...snap, pausedAtMs: Date.now() - 120_000 };
+    d = await nowPlaying();
+    assert.equal(d.visible, false);
+    snap = { ...snap, pausedAtMs: null, playing: true };
+    d = await nowPlaying();
+    assert.deepEqual([d.playing, d.paused, d.visible], [true, false, true]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Spotify polling slows down only after a long idle', () => {
+  const polling = { activeMs: 2000, idleMs: 5000, deepIdleMs: 30_000, deepIdleAfterMs: 600_000 };
+  const delay = (playing, idleFor) => nextPollDelay({ playing, lastPlayingMs: 0, nowMs: idleFor, polling });
+  assert.equal(delay(true, 9_000_000), 2000);
+  assert.equal(delay(false, 599_999), 5000);
+  assert.equal(delay(false, 600_000), 30_000);
+});
+
+test('RepeatLimiter logs a repeating warning once, then a count per interval', () => {
+  const lines = [];
+  let nowMs = 0;
+  const limiter = new RepeatLimiter({ log: (l) => lines.push(l), intervalMs: 1000, now: () => nowMs });
+
+  limiter.warn('a', 'down');
+  limiter.warn('a', 'down');
+  limiter.warn('a', 'down');
+  assert.deepEqual(lines, ['down']);
+
+  nowMs = 1000;
+  limiter.warn('a', 'down');
+  assert.equal(lines[1], 'down (repeated 3 more times)');
+
+  limiter.warn('a', 'other');
+  assert.equal(lines[2], 'other', 'a new message is logged straight away');
+  limiter.warn('b', 'down');
+  assert.equal(lines[3], 'down', 'keys are independent');
+
+  limiter.recovered('a', 'back');
+  assert.equal(lines[4], 'back (after 1 failed attempts)');
+  limiter.recovered('a', 'back');
+  assert.equal(lines.length, 5, 'recovery is reported once');
+});
+
+test('Berry script sits out the rotation through should_show and holds it while playing', async () => {
+  const script = await fs.readFile(new URL('../berry/spotify_now_playing.be', import.meta.url), 'utf8');
+  assert.match(script, /def should_show\(\)\n\s+return self\.visible && !self\.is_offline\(\)/);
+  assert.match(script, /self\.keep_on_screen && self\.shown && self\.playing && !self\.is_offline\(\)/);
+  assert.match(script, /def init\(\)[\s\S]*rotation\.resume\(\)[\s\S]*def tick\(\)/);
+});
+
+test('AwtrixCoordinator leaves an app that is already on alone', async () => {
+  const calls = [];
+  const coord = new AwtrixCoordinator({
+    host: '192.168.1.50',
+    autoInstallScript: false,
+    client: {
+      apps: {
+        list: async () => [{ name: 'spotify', enabled: true }],
+        setEnabled: async () => calls.push('setEnabled'),
+        setOrder: async () => calls.push('setOrder'),
+      },
+    },
+  });
+  await coord.onPlaybackState({ playing: false, id: '' });
+  await coord.onPlaybackState({ playing: false, id: '' });
+  assert.deepEqual(calls, []);
+  assert.equal(coord.appEnabled, true);
 });
