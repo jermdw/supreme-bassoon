@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RepeatLimiter } from './logging.js';
+import { isClockVisible } from './playback.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SCRIPT_PATH = path.resolve(__dirname, '../berry/spotify_now_playing.be');
@@ -20,7 +22,8 @@ export class AwtrixCoordinator {
     appName = 'spotify',
     autoInstallScript = true,
     switchOnTrackChange = true,
-    pauseGraceMs = 6000,
+    pausedScreenMs = 300_000,
+    keepOnScreen = false,
     serverLanUrl,
     pollActiveMs = 2000,
     clockToken = '',
@@ -34,7 +37,8 @@ export class AwtrixCoordinator {
     this.appName = appName;
     this.autoInstallScript = autoInstallScript;
     this.switchOnTrackChange = switchOnTrackChange;
-    this.pauseGraceMs = pauseGraceMs;
+    this.pausedScreenMs = pausedScreenMs;
+    this.keepOnScreen = keepOnScreen;
     this.serverLanUrl = serverLanUrl;
     this.pollActiveMs = pollActiveMs;
     this.clockToken = clockToken;
@@ -45,7 +49,8 @@ export class AwtrixCoordinator {
     this.useOrderRoute = false;
     this.appEnabled = null;
     this.lastActiveTrackId = '';
-    this.pauseTimer = null;
+    this.showing = false;
+    this.warnings = new RepeatLimiter();
     this.lastError = null;
     this.lastSyncAt = null;
     this.scriptSyncPromise = null;
@@ -97,6 +102,17 @@ export class AwtrixCoordinator {
     await client.apps.setOrder({ order, disabled });
   }
 
+  /** Switches the app on if it's off. A no-op otherwise, since the order route rewrites the rotation. */
+  async _ensureEnabled(client) {
+    const apps = await client.apps.list();
+    const app = apps.find((entry) => entry.name === this.appName);
+    if (app && !app.enabled) {
+      await this._setAppEnabled(client, true);
+      console.log(`[awtrix] Enabled "${this.appName}" in rotation`);
+    }
+    this.appEnabled = true;
+  }
+
   async ensureScriptInstalled() {
     if (!this.isConfigured() || !this.autoInstallScript || this.scriptSynced) {
       return;
@@ -113,6 +129,10 @@ export class AwtrixCoordinator {
     try {
       const client = await this._getClient();
       const desiredSource = await fs.readFile(this.scriptPath, 'utf8');
+
+      // A script installed while its app is off never starts its timers once switched on, even
+      // though it draws and reports as enabled (seen on 1.1.2). So this has to come first.
+      await this._ensureEnabled(client);
 
       let existingSource = null;
       try {
@@ -132,35 +152,34 @@ export class AwtrixCoordinator {
         console.log(`[awtrix] Installed Berry script "${this.appName}" on ${this.host}`);
       }
 
-      // Sync @config store only if server_url, poll_ms or token differs
+      // Saving the config restarts the script, so only do it when a value differs.
+      const desiredConfig = {
+        server_url: this.serverLanUrl,
+        poll_ms: this.pollActiveMs,
+        token: this.clockToken,
+        keep_on_screen: this.keepOnScreen,
+      };
       let needsConfigUpdate = true;
       try {
-        const currentCfg = await client.scripts.getConfig(this.appName);
-        const curUrl = currentCfg?.server_url?.value ?? currentCfg?.server_url;
-        const curPoll = currentCfg?.poll_ms?.value ?? currentCfg?.poll_ms;
-        const curToken = currentCfg?.token?.value ?? currentCfg?.token;
-        if (curUrl === this.serverLanUrl && Number(curPoll) === this.pollActiveMs && curToken === this.clockToken) {
-          needsConfigUpdate = false;
-        }
+        const { fields = [] } = await client.scripts.getConfig(this.appName);
+        const current = Object.fromEntries(fields.map((field) => [field.key, field.value]));
+        needsConfigUpdate = Object.entries(desiredConfig).some(([key, value]) => current[key] !== value);
       } catch {
         // Proceed with updateConfig
       }
 
       if (needsConfigUpdate) {
-        await client.scripts.updateConfig(this.appName, {
-          server_url: this.serverLanUrl,
-          poll_ms: this.pollActiveMs,
-          token: this.clockToken,
-        });
+        await client.scripts.updateConfig(this.appName, desiredConfig);
         console.log(`[awtrix] Configured "${this.appName}" -> server_url=${this.serverLanUrl}`);
       }
 
       this.scriptSynced = true;
       this.lastError = null;
       this.lastSyncAt = new Date().toISOString();
+      this.warnings.recovered('sync', '[awtrix] Script synced');
     } catch (err) {
       this.lastError = err.message;
-      console.warn(`[awtrix] Failed syncing script to ${this.host}: ${err.message}`);
+      this.warnings.warn('sync', `[awtrix] Failed syncing script to ${this.host}: ${err.message}`);
     }
   }
 
@@ -186,7 +205,7 @@ export class AwtrixCoordinator {
         await this.onPlaybackState(state);
       } catch (err) {
         this.lastError = err.message;
-        console.warn(`[awtrix] Failed applying playback state: ${err.message}`);
+        this.warnings.warn('apply', `[awtrix] Failed applying playback state: ${err.message}`);
       }
     }
   }
@@ -196,71 +215,36 @@ export class AwtrixCoordinator {
 
     await this.ensureScriptInstalled();
 
-    if (state.playing && state.id) {
-      if (this.pauseTimer) {
-        clearTimeout(this.pauseTimer);
-        this.pauseTimer = null;
+    const playing = Boolean(state.playing && state.id);
+    const visible = playing || isClockVisible(state, Date.now(), this.pausedScreenMs);
+
+    try {
+      const client = await this._getClient();
+      // A switched-off script can't poll, so the app stays on and the script's should_show()
+      // decides whether it takes a turn in the rotation.
+      if (this.appEnabled !== true) {
+        await this._ensureEnabled(client);
       }
 
-      const wasHidden = this.appEnabled !== true;
-      const trackChanged = state.id !== this.lastActiveTrackId;
-      this.lastActiveTrackId = state.id;
-
-      try {
-        const client = await this._getClient();
-        if (wasHidden) {
-          await this._setAppEnabled(client, true);
-          this.appEnabled = true;
-          console.log(`[awtrix] Enabled "${this.appName}" in rotation`);
-        }
-
-        if (wasHidden || (trackChanged && this.switchOnTrackChange)) {
+      if (playing) {
+        const trackChanged = state.id !== this.lastActiveTrackId;
+        if (!this.showing || (trackChanged && this.switchOnTrackChange)) {
           await client.apps.switchTo(this.appName);
           console.log(`[awtrix] Switched display to "${this.appName}" (${state.artist} - ${state.title})`);
         }
-        this.lastError = null;
-        this.lastSyncAt = new Date().toISOString();
-      } catch (err) {
-        this.lastError = err.message;
-        this.appEnabled = null; // Force re-sync once clock is reachable again
-        console.warn(`[awtrix] Failed updating clock state: ${err.message}`);
+        this.lastActiveTrackId = state.id;
       }
-      return;
-    }
+      if (!visible) this.lastActiveTrackId = '';
+      this.showing = visible;
 
-    // Paused or stopped: schedule auto-hide after grace period
-    if (this.appEnabled !== false && !this.pauseTimer) {
-      if (this.pauseGraceMs <= 0) {
-        await this._disableApp();
-      } else {
-        this.pauseTimer = setTimeout(() => {
-          this.pauseTimer = null;
-          this._disableApp().catch(() => {});
-        }, this.pauseGraceMs);
-      }
-    }
-  }
-
-  async _disableApp() {
-    try {
-      const client = await this._getClient();
-      await this._setAppEnabled(client, false);
-      this.appEnabled = false;
-      this.lastActiveTrackId = '';
       this.lastError = null;
       this.lastSyncAt = new Date().toISOString();
-      console.log(`[awtrix] Playback idle — hid "${this.appName}" from rotation`);
+      this.warnings.recovered('state', '[awtrix] Clock reachable again');
     } catch (err) {
       this.lastError = err.message;
-      this.appEnabled = null;
-      console.warn(`[awtrix] Failed hiding "${this.appName}": ${err.message}`);
+      this.appEnabled = null; // Force re-sync once clock is reachable again
+      this.warnings.warn('state', `[awtrix] Failed updating clock state: ${err.message}`);
     }
   }
 
-  dispose() {
-    if (this.pauseTimer) {
-      clearTimeout(this.pauseTimer);
-      this.pauseTimer = null;
-    }
-  }
 }

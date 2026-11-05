@@ -22,7 +22,7 @@ flowchart LR
 
     subgraph Desktop["Always-On Desktop (Docker)"]
         Bridge["awtrix-spotify (:8765)\nNode 22 + sharp + awtrix-ng-api"]
-        Store[("./data/tokens.json\nOAuth Refresh Token")]
+        Store[("Docker volume: tokens.json\nOAuth Refresh Token")]
     end
 
     subgraph Clock["Ulanzi TC002 (52x16 AWTRIX NG)"]
@@ -34,7 +34,7 @@ flowchart LR
     Bridge -->|OAuth 2.0 Poll| WebAPI
     Bridge -->|Lanczos + LED Gamma| CDN
     Bridge <--> Store
-    Bridge -->|"Auto-Install, setEnabled,\nswitchTo on Track Change"| Clock
+    Bridge -->|"Auto-Install, Config,\nswitchTo on Track Change"| Clock
     Berry -->|"GET /api/now-playing?clock=1&art=id"| Bridge
     Buttons -->|"GET /api/action/play|pause|next?token=…"| Bridge
 ```
@@ -42,7 +42,7 @@ flowchart LR
 ### Why a Hybrid Docker + Berry Design?
 
 1. **Docker handles what microcontrollers shouldn't:** Spotify OAuth 2.0 refresh-token rotation, downloading JPEG cover art, `16×16` Lanczos3 downsampling, LED gamma black-floor clamping (so dark album shadows turn off cleanly instead of glowing muddy grey), and vibrant accent color extraction.
-2. **Berry handles `40 FPS` rendering locally on the clock:** Instead of spamming 20+ HTTP draw payloads per second over Wi-Fi, [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be) runs directly on the TC002's ESP32-S3, scrolling both text lines independently and interpolating the progress bar between 2-second polls.
+2. **Berry handles `40 FPS` rendering locally on the clock:** Instead of spamming 20+ HTTP draw payloads per second over Wi-Fi, [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be) runs directly on the TC002's the clock, scrolling both text lines independently and interpolating the progress bar between 2-second polls.
 3. **Delta Artwork Caching over Wi-Fi:** The clock passes `?art=<cover_id>` on each poll. When it already holds the current cover, the bridge omits the 256-pixel RGB array—shrinking poll responses to ~200 bytes.
 
 ---
@@ -53,13 +53,13 @@ flowchart LR
 Columns: 0               15  16  17                                51
        ┌───────────────────┬───┬────────────────────────────────────┐
 Row  0 │                   │   │                                    │
-Row  1 │                   │   │  INSTANT CRUSH        (White 3x5)  │
+Row  1 │                   │   │  Instant Crush            (White)  │
   ..   │   16×16 Album     │ 1 │  ← independent smooth ticker       │
 Row  5 │    Cover Art      │ p │                                    │
 Row  6 │  (LED Gamma +     │ x │  (2px vertical breathing gap)      │
-Row  8 │   Sat Boosted)    │   │  DAFT PUNK     (Album Accent Hue)  │
+Row  9 │   Sat Boosted)    │   │  Daft Punk     (Album Accent Hue)  │
   ..   │                   │ G │  ← staggered smooth ticker         │
-Row 12 │                   │ a │                                    │
+Row 13 │                   │ a │                                    │
 Row 15 │                   │ p │  ████████████████████░░░░░░░░░░░░  │ ← 1px Progress Bar
        └───────────────────┴───┴────────────────────────────────────┘
 ```
@@ -141,9 +141,10 @@ docker compose logs -f
 
 | Trigger / Input | Behavior |
 | :--- | :--- |
-| **Playback Starts** | Enables `spotify` in the AWTRIX NG app rotation and switches straight to it |
-| **Track Changes** | Switches the display back to `spotify` immediately so you see the new song & cover |
-| **Playback Paused** | Waits `PAUSE_GRACE_MS` (`6s` default), then disables `spotify` from rotation so only active apps cycle |
+| **Playback Starts** | Switches straight to `spotify` |
+| **Track Changes** | Switches the display back to `spotify` immediately and wipes in the new cover |
+| **Playing** | With `KEEP_ON_SCREEN=true`, the rotation stays on `spotify`. Pressing a button to change apps still works, and the app holds again on its next turn |
+| **Playback Paused** | Shows a dimmed cover with a pause icon and stays in the rotation for `PAUSED_SCREEN_MS` (`5 min` default), so you can resume from the clock. After that, or when playback stops, it sits out the rotation while the script keeps checking in |
 | **Bridge Unreachable** | After `15s` of failed requests, the clock shows `OFFLINE` on the artist line and freezes the progress bar until the bridge answers again |
 | **Spotify Errors** | The current song stays up through brief errors. After `60s` of failures it counts as stopped, and the dashboard shows the error |
 | **Middle / Knob Press (`select`)** | Toggles Spotify **Play / Pause** with an on-screen `PLAY` / `PAUSE` badge |
@@ -167,7 +168,10 @@ docker compose logs -f
 | `SERVER_LAN_URL` | `http://<detected-ip>:8765` | LAN URL the TC002 uses to poll this container |
 | `POLL_ACTIVE_MS` | `2000` | Poll interval (ms) while music is playing |
 | `POLL_IDLE_MS` | `5000` | Poll interval (ms) when paused/idle |
-| `PAUSE_GRACE_MS` | `6000` | Delay (ms) before hiding the app after playback pauses |
+| `PAUSED_SCREEN_MS` | `300000` | How long (ms) a paused song stays in the rotation before the app sits out (`0` = straight away) |
+| `KEEP_ON_SCREEN` | `false` | Stay on the `spotify` app while music plays instead of rotating away |
+| `POLL_DEEP_IDLE_MS` | `30000` | Spotify poll interval (ms) once nothing has played for `DEEP_IDLE_AFTER_MS` |
+| `DEEP_IDLE_AFTER_MS` | `600000` | How long (ms) without playback before switching to `POLL_DEEP_IDLE_MS` |
 | `SWITCH_ON_TRACK_CHANGE` | `true` | Immediately switch clock view to `spotify` when a new track starts |
 | `ASCII_TRANSLITERATE` | `true` | Transliterate accents & smart quotes for clean bitmap font rendering |
 | `LED_GAMMA` | `1.55` | Gamma curve for `16×16` album art on physical RGB LEDs |
@@ -191,9 +195,12 @@ docker compose logs -f
 ## Tuning & Troubleshooting
 
 - **Album colors look too bright or dark shadows look grey:** Adjust `LED_GAMMA` (default `1.55`; higher values darken midtones/shadows) and `LED_SATURATION` (default `1.25`) in `.env`, then run `docker compose up -d`.
-- **Clock stays on `"Spotify / Waiting..."` or shows `OFFLINE`:** Check **Clock Last Polled** on the dashboard. The clock stops polling while the app is hidden, so this only counts during playback. If it isn't updating then, the clock can't reach the bridge:
+- **Clock never shows Spotify, or shows `OFFLINE`:** Check **Clock Last Polled** on the dashboard. The clock checks in at least every `10s` even when nothing is playing, so if this isn't updating, the clock can't reach the bridge:
   1. Ensure `SERVER_LAN_URL` in `.env` uses your desktop's actual LAN IP (e.g. `http://192.168.1.100:8765`, **not** `127.0.0.1`).
   2. Check that your desktop's firewall allows inbound TCP port `8765` from your local network.
+- **Port 8765 won't publish or times out on Windows:** Another program or a leftover Windows `netsh interface portproxy` rule may already hold the port. Check with `netstat -ano | findstr 8765` and `netsh interface portproxy show v4tov4`, then recreate the container.
+- **PC and clock on different subnets:** The bridge must reach `AWTRIX_HOST` to install the script and switch apps. If the clock's network is only reachable through one adapter, such as Wi-Fi, keep that adapter connected. Without it, the clock can still poll, but the bridge can't switch to the app.
+- **Firmware updates on TC002 builds before 1.2.2:** These reject `.awup` packages over the web with `invalidImage`, and the USB installer stops on clocks that already run AWTRIX NG. The documented route is a full wipe: hold reset for 5 seconds to restore the Ulanzi firmware, then reinstall. The bridge works on 1.1.2, so you don't need the update for Spotify.
 - **Manual Berry Script Installation:** If you set `AUTO_INSTALL_SCRIPT=false`, open your clock's Web UI → **Scripts**, create a script named `spotify`, paste the contents of [`berry/spotify_now_playing.be`](berry/spotify_now_playing.be), and set its **Bridge Server URL** config field to `http://<YOUR_DESKTOP_LAN_IP>:8765`. Also set its **Bridge Token** field to the value the bridge prints in `docker compose logs` at startup, or the clock's buttons will get a `403`.
 
 ---

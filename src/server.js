@@ -3,6 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isClockVisible } from './playback.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT_PATH = path.resolve(__dirname, '../berry/spotify_now_playing.be');
@@ -318,11 +319,17 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
         for (let y = 0; y < 16; y++) {
           for (let x = 0; x < 16; x++) {
             const c = state.art[y * 16 + x];
-            setLed(fb, x, y, c > 0 ? c : 0x090c10);
+            setLed(fb, x, y, c > 0 ? (state.paused ? (c >> 1) & 0x7f7f7f : c) : 0x090c10);
           }
         }
       } else {
         for (let y = 3; y < 13; y++) for (let x = 3; x < 13; x++) setLed(fb, x, y, 0x1db954);
+      }
+
+      if (state.paused) {
+        for (let y = 4; y < 12; y++) {
+          for (const x of [5, 6, 9, 10]) setLed(fb, x, y, 0xffffff);
+        }
       }
 
       const elapsed = Math.min(state.durationMs || 1, (state.progressMs || 0) + (state.playing ? performance.now() - state.fetchedAt : 0));
@@ -349,14 +356,9 @@ function renderDashboardHtml({ config, authorized, awtrixStatus, message = '', e
       const clockPollEl = document.getElementById('clockPoll');
       const ago = d.clockLastPollAgoMs;
       const seconds = ago === null ? null : Math.round(ago / 1000);
-      // The clock pauses the script while the app is hidden, so silence is expected then.
-      const late = !d.clockAppHidden && (seconds === null || seconds > 15);
+      const late = seconds === null || seconds > 15;
       const when = seconds === null ? 'Not since the bridge started' : seconds + 's ago';
-      if (d.clockAppHidden) {
-        clockPollEl.textContent = when + ' (paused while nothing is playing)';
-      } else {
-        clockPollEl.textContent = late ? when + ' — check SERVER_LAN_URL, the published port, and your firewall' : when;
-      }
+      clockPollEl.textContent = late ? when + ' — check SERVER_LAN_URL, the published port, and your firewall' : when;
       clockPollEl.style.color = late ? 'var(--warn)' : '';
       document.getElementById('spotifyWarn').textContent = d.spotifyError ? 'Spotify problem: ' + d.spotifyError : '';
     }
@@ -434,6 +436,8 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
           durationMs: snap.durationMs,
           accent: snap.accent,
           artId,
+          paused: Boolean(snap.pausedAtMs),
+          visible: isClockVisible(snap, Date.now(), config.polling.pausedScreenMs),
         };
         if (includeArt) {
           payload.art = snap.art;
@@ -449,7 +453,7 @@ export function createBridgeServer({ config, spotify, awtrix, getCurrentSnapshot
             ? Math.min(snap.durationMs, snap.progressMs + Math.max(0, Date.now() - snap.updatedAtMs))
             : snap.progressMs,
           clockLastPollAgoMs: lastClockPollMs === null ? null : Date.now() - lastClockPollMs,
-          clockAppHidden: awtrix.appEnabled === false,
+          paused: Boolean(snap.pausedAtMs),
         });
       }
 

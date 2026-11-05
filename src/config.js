@@ -55,12 +55,15 @@ export function loadConfig(env = process.env) {
       appName: (env.AWTRIX_APP_NAME || 'spotify').trim(),
       autoInstallScript: parseBool(env.AUTO_INSTALL_SCRIPT, true),
       switchOnTrackChange: parseBool(env.SWITCH_ON_TRACK_CHANGE, true),
+      keepOnScreen: parseBool(env.KEEP_ON_SCREEN, false),
     },
 
     polling: {
       activeMs: parseIntSafe(env.POLL_ACTIVE_MS, 2000, 1000),
       idleMs: parseIntSafe(env.POLL_IDLE_MS, 5000, 1000),
-      pauseGraceMs: parseIntSafe(env.PAUSE_GRACE_MS, 6000, 0),
+      deepIdleMs: parseIntSafe(env.POLL_DEEP_IDLE_MS, 30_000, 1000),
+      deepIdleAfterMs: parseIntSafe(env.DEEP_IDLE_AFTER_MS, 600_000, 0),
+      pausedScreenMs: parseIntSafe(env.PAUSED_SCREEN_MS, 300_000, 0),
     },
 
     display: {
